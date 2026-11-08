@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unbrake TV</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='3' y='6' width='26' height='17' rx='3' fill='%2338bdf8'/><rect x='11' y='25' width='10' height='2' rx='1' fill='%2338bdf8'/></svg>">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg viewBox="0 0 32 32" width="28" height="28"><rect x="3" y="6" width="26" height="17" rx="3" fill="none" stroke="currentColor" stroke-width="2.2"/><path d="M11 27h10" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><path d="M17.5 8.5l-5 6h4l-2 5 5-6.5h-4z" fill="currentColor"/></svg>
+    <span>Unbrake<b>TV</b></span>
+  </div>
+  <div id="devchip" class="devchip hidden"></div>
+  <div class="spacer"></div>
+  <button id="btnDisconnect" class="ghost hidden">Отключиться</button>
+  <button id="btnQuit" class="ghost">Выход</button>
+</header>
+
+<!-- ===== Подключение ===== -->
+<main id="connectView" class="view">
+  <section class="hero">
+    <h1>Хватит тормозить</h1>
+    <p class="muted">Подключитесь к Android TV по сети, посмотрите, что его нагружает, и уберите заводской мусор. Всё удалённое можно вернуть.</p>
+  </section>
+
+  <div class="grid2">
+    <section class="card">
+      <h2>1. Найдите телевизор</h2>
+      <button id="btnScan" class="primary wide">Найти в сети</button>
+      <div id="scanResults" class="scanlist"></div>
+      <div class="or"><span>или введите IP вручную</span></div>
+      <form id="connectForm" class="row">
+        <input id="addr" placeholder="192.168.1.50" autocomplete="off" spellcheck="false">
+        <button class="primary" type="submit">Подключиться</button>
+      </form>
+      <div id="connectStatus" class="status hidden"></div>
+    </section>
+
+    <section class="card help">
+      <h2>Подготовка телевизора</h2>
+      <ol>
+        <li>Настройки → Об устройстве → 7 раз нажмите на <b>«Сборка»</b>, чтобы включить режим разработчика.</li>
+        <li>В разделе <b>«Для разработчиков»</b> включите <b>«Отладка по USB»</b> (или «Отладка по сети»).</li>
+        <li>Компьютер и телевизор должны быть в одной сети.</li>
+        <li>При первом подключении на экране ТВ появится запрос — отметьте <b>«Всегда разрешать»</b> и нажмите OK.</li>
+      </ol>
+      <p class="muted small">Работает с телевизорами и приставками на Android TV и Google TV: Xiaomi, Sony, TCL, Philips, Haier, Hisense (Android), Mi Box, Chromecast и др. Samsung (Tizen) и LG (webOS) не поддерживают удаление системных приложений.</p>
+    </section>
+  </div>
+</main>
+
+<!-- ===== Основной экран ===== -->
+<main id="mainView" class="view hidden">
+  <nav class="tabs">
+    <button data-tab="overview" class="active">Нагрузка</button>
+    <button data-tab="apps">Приложения <span id="recCount" class="pill hidden"></span></button>
+    <button data-tab="removed">Удалённые <span id="remCount" class="pill gray hidden"></span></button>
+    <button data-tab="history">Журнал</button>
+  </nav>
+
+  <!-- Нагрузка -->
+  <section id="tab-overview" class="tab">
+    <div class="metrics">
+      <div class="metric"><div class="mlabel">Процессор</div><div class="mval" id="mCpu">—</div><div class="bar"><i id="bCpu"></i></div></div>
+      <div class="metric"><div class="mlabel">Оперативная память</div><div class="mval" id="mMem">—</div><div class="bar"><i id="bMem"></i></div><div class="msub" id="sMem"></div></div>
+      <div class="metric"><div class="mlabel">Память устройства</div><div class="mval" id="mStor">—</div><div class="bar"><i id="bStor"></i></div><div class="msub" id="sStor"></div></div>
+      <div class="metric"><div class="mlabel">Температура</div><div class="mval" id="mTemp">—</div><div class="msub" id="sTemp"></div></div>
+    </div>
+    <div class="card">
+      <div class="cardhead"><h2>Нагрузка за последние 2 минуты</h2>
+        <div class="legend"><span class="lg cpu"></span>Процессор <span class="lg mem"></span>Память</div></div>
+      <canvas id="chart" height="180"></canvas>
+    </div>
+    <div class="card">
+      <div class="cardhead"><h2>Что сейчас нагружает телевизор</h2><span class="muted small">обновляется каждые 2 секунды</span></div>
+      <table class="tbl"><thead><tr><th>Приложение</th><th>Оценка</th><th class="num">Процессор</th><th class="num">Память</th></tr></thead>
+      <tbody id="topBody"></tbody></table>
+    </div>
+    <div id="advice" class="card advice hidden"></div>
+    <div class="card">
+      <div class="cardhead"><h2>Быстрые улучшения</h2><span class="muted small">всё обратимо</span></div>
+      <div class="tweaks">
+        <div class="tweak">
+          <div><b>Скорость анимаций</b><div class="muted small">Меню открываются мгновенно — особенно заметно на слабых ТВ.</div></div>
+          <div class="seg" id="animSeg"><button data-a="anim_default" data-v="1">Обычная</button><button data-a="anim_fast" data-v="0.5">Быстрее ×2</button><button data-a="anim_off" data-v="0">Без анимаций</button></div>
+        </div>
+        <div class="tweak">
+          <div><b>Очистить кэш приложений</b><div class="muted small">Освобождает память устройства. Данные и вход в аккаунты не затрагиваются.</div></div>
+          <button class="ghost" data-tweak="trim_caches">Очистить</button>
+        </div>
+        <div class="tweak">
+          <div><b>Перезагрузить телевизор</b><div class="muted small">Нужно после удаления, чтобы освободить оперативную память.</div></div>
+          <button class="ghost" data-tweak="reboot">Перезагрузить</button>
+        </div>
+        <div class="tweak">
+          <div><b>Выключить отладку и отключиться</b><div class="muted small">Закрывает доступ к телевизору по сети. Рекомендуем сделать в конце.</div></div>
+          <button class="ghost" data-tweak="adb_off">Выключить</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Приложения -->
+  <section id="tab-apps" class="tab hidden">
+    <div class="toolbar">
+      <div class="filters" id="filters">
+        <button data-f="recommended" class="active">Рекомендуем удалить</button>
+        <button data-f="optional">Можно удалить</button>
+        <button data-f="caution">Осторожно</button>
+        <button data-f="unknown">Неизвестные</button>
+        <button data-f="critical">Критичные</button>
+        <button data-f="all">Все</button>
+      </div>
+      <input id="search" placeholder="Поиск по названию или пакету" spellcheck="false">
+      <label class="chk"><input type="checkbox" id="onlyRunning"> только запущенные</label>
+      <button class="ghost small-btn" id="btnExport" title="Сохранить список удалённого, чтобы повторить на другом ТВ">Экспорт профиля</button>
+      <button class="ghost small-btn" id="btnImport" title="Отметить приложения из сохранённого профиля">Импорт профиля</button>
+      <input type="file" id="importFile" accept=".json,application/json" class="hidden">
+    </div>
+    <div class="legendbox">
+      <span class="badge recommended">Рекомендуем</span> реклама, телеметрия, промо — безопасно
+      <span class="badge optional">Можно</span> обычные приложения
+      <span class="badge caution">Осторожно</span> пропадёт функция
+      <span class="badge unknown">Неизвестно</span> нет данных
+      <span class="badge critical">Критично</span> может сломать систему
+    </div>
+    <div class="card nopad">
+      <table class="tbl apps">
+        <thead><tr>
+          <th class="cb"><input type="checkbox" id="selAll" title="Выбрать все видимые"></th>
+          <th data-sort="name">Приложение</th><th>Оценка</th>
+          <th data-sort="mem" class="num">Память</th><th data-sort="size" class="num">Размер</th>
+        </tr></thead>
+        <tbody id="appsBody"></tbody>
+      </table>
+      <div id="appsEmpty" class="empty hidden">Ничего не найдено</div>
+    </div>
+  </section>
+
+  <!-- Удалённые -->
+  <section id="tab-removed" class="tab hidden">
+    <p class="muted">Приложения, удалённые или отключённые для пользователя. Их файлы остались в прошивке, поэтому их можно вернуть в один клик. Сброс к заводским настройкам тоже вернёт всё.</p>
+    <div class="card nopad">
+      <table class="tbl apps"><thead><tr><th class="cb"><input type="checkbox" id="selAllRem"></th><th>Приложение</th><th>Оценка</th><th>Состояние</th></tr></thead>
+      <tbody id="remBody"></tbody></table>
+      <div id="remEmpty" class="empty hidden">Пока ничего не удалено</div>
+    </div>
+  </section>
+
+  <!-- Журнал -->
+  <section id="tab-history" class="tab hidden">
+    <div id="historyList"></div>
+  </section>
+
+  <div id="actionbar" class="actionbar hidden">
+    <span id="selInfo"></span>
+    <div class="spacer"></div>
+    <button id="btnClear" class="ghost">Снять выбор</button>
+    <button id="btnAction" class="danger">Удалить</button>
+  </div>
+</main>
+
+<!-- ===== Модальные окна ===== -->
+<div id="modal" class="modal hidden">
+  <div class="dialog">
+    <h2 id="mTitle"></h2>
+    <div id="mBody"></div>
+    <div class="dlgbtns">
+      <button id="mCancel" class="ghost">Отмена</button>
+      <button id="mOk" class="danger">OK</button>
+    </div>
+  </div>
+</div>
+<div id="toast" class="toast hidden"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

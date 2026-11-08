@@ -1,0 +1,28 @@
+name: Отчёт о телевизоре / ошибке
+description: Что-то не так на вашем телевизоре или в базе знаний пакетов
+labels: [tv-report]
+body:
+  - type: input
+    id: model
+    attributes:
+      label: Марка и модель телевизора
+      placeholder: Xiaomi Mi TV A2 43
+    validations:
+      required: true
+  - type: input
+    id: android
+    attributes:
+      label: Версия Android
+      placeholder: "11"
+  - type: textarea
+    id: what
+    attributes:
+      label: Что произошло
+      description: Что вы удалили или нажали, что ожидали и что получилось.
+    validations:
+      required: true
+  - type: textarea
+    id: profile
+    attributes:
+      label: Профиль (необязательно)
+      description: Вкладка «Приложения» → «Экспорт профиля». Перетащите файл сюда.

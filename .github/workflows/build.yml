@@ -1,0 +1,40 @@
+name: build
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./... && go test ./...
+      - name: Build UnbrakeTV.exe
+        run: |
+          VERSION=dev
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then VERSION="${GITHUB_REF_NAME#v}"; fi
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o distr/UnbrakeTV.exe .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UnbrakeTV
+          path: distr/UnbrakeTV.exe
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Unbrake TV ${{ github.ref_name }}
+          files: distr/UnbrakeTV.exe
+          body: |
+            ## Как запустить
+
+            1. Скачайте **UnbrakeTV.exe** ниже, в разделе Assets.
+            2. Запустите его — установка не нужна. Интерфейс откроется в браузере.
+            3. Если Windows покажет «Система Windows защитила ваш компьютер» — нажмите **«Подробнее» → «Выполнить в любом случае»**. Программа не подписана платным сертификатом, exe собран автоматически из кода этого репозитория.
+
+            Подготовка телевизора и подробная инструкция — в [README](https://github.com/Smrnw/UnbrakeTV#как-пользоваться). Список изменений — в [CHANGELOG](https://github.com/Smrnw/UnbrakeTV/blob/main/CHANGELOG.md).
