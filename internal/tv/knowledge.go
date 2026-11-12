@@ -70,6 +70,7 @@ var rules = []rule{
 	r("com.android.statementservice", Caution, "Проверка ссылок", "Системный компонент."),
 	r("com.android.dynsystem", Recommended, "Dynamic System Updates", "Режим для разработчиков, на ТВ не нужен."),
 	r("com.android.cts.*", Recommended, "Заглушка для тестов CTS", "Нужна только при сертификации прошивки."),
+	r("com.android.retaildemo", Recommended, "Демо-режим магазина", "Нужен только на витрине."),
 	r("com.android.printspooler", Recommended, "Печать", "Печатать с телевизора никто не будет."),
 	r("com.android.htmlviewer", Optional, "Просмотр HTML", "Почти никогда не используется."),
 	r("com.android.dreams.basic", Optional, "Базовая заставка", "Простая заставка."),
@@ -83,7 +84,6 @@ var rules = []rule{
 	// ---------- Google ----------
 	r("com.google.android.gms", Critical, "Сервисы Google Play", "Без них не работают Play Маркет, YouTube, вход в аккаунт."),
 	r("com.google.android.gsf", Critical, "Google Services Framework", "Без него не работают сервисы Google."),
-	r("com.android.vending", Critical, "Google Play Маркет", "Без него не установить и не обновить приложения."),
 	r("com.google.android.webview", Critical, "Android System WebView", "Нужен приложениям для показа веб-страниц."),
 	r("com.google.android.ext.*", Critical, "Сервисы Android", "Системный модуль Android."),
 	r("com.google.android.modulemetadata", Critical, "Метаданные модулей", "Системный модуль Android."),
@@ -186,6 +186,10 @@ var rules = []rule{
 	r("com.vk.tv", Optional, "VK Видео", "Видеосервис."),
 	r("ru.kinopoisk.tv", Optional, "Кинопоиск", "Онлайн-кинотеатр."),
 	r("ru.okko.tv", Optional, "Okko", "Онлайн-кинотеатр."),
+
+	// ---------- Сторонние рабочие столы ----------
+	r("com.spocky.projengmenu", Optional, "Projectivy Launcher", "Лёгкий рабочий стол без рекламы."),
+	r("me.efesser.flauncher", Optional, "FLauncher", "Лёгкий открытый рабочий стол без рекламы."),
 }
 
 // telemetryHints catch unknown system packages that look like ads/telemetry.
@@ -198,7 +202,15 @@ func Lookup(pkg string, thirdParty bool) Info {
 			inf := ru.Info
 			// For wildcard matches keep the package name visible.
 			if strings.HasSuffix(ru.pattern, "*") && inf.Level == Unknown {
+				if thirdParty {
+					// Installed by the user from the store: an ordinary app, not a firmware part.
+					break
+				}
 				inf.Name = pkg
+				// A vendor component we have no entry for may still give itself away by name.
+				if !thirdParty && looksLikeTelemetry(pkg) {
+					inf.Level, inf.Reason = Recommended, telemetryReason
+				}
 			}
 			return inf
 		}
@@ -209,13 +221,22 @@ func Lookup(pkg string, thirdParty bool) Info {
 	if strings.Contains(pkg, "auto_generated_rro") {
 		return Info{Name: "Системный оверлей", Reason: "Настройки ресурсов прошивки. Удаление может сломать систему.", Level: Critical}
 	}
+	if looksLikeTelemetry(pkg) {
+		return Info{Name: pkg, Reason: telemetryReason, Level: Recommended}
+	}
+	return Info{Name: pkg, Reason: "Системный компонент производителя, о котором ничего не известно. Удаляйте только если уверены.", Level: Unknown}
+}
+
+const telemetryReason = "Похоже на телеметрию, рекламу или демо-режим."
+
+func looksLikeTelemetry(pkg string) bool {
 	low := strings.ToLower(pkg)
 	for _, h := range telemetryHints {
 		if strings.Contains(low, h) {
-			return Info{Name: pkg, Reason: "Похоже на телеметрию, рекламу или демо-режим.", Level: Recommended}
+			return true
 		}
 	}
-	return Info{Name: pkg, Reason: "Системный компонент производителя, о котором ничего не известно. Удаляйте только если уверены.", Level: Unknown}
+	return false
 }
 
 func matches(pattern, pkg string) bool {

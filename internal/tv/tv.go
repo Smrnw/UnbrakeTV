@@ -4,6 +4,7 @@ package tv
 import (
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"sort"
 	"strconv"
@@ -22,6 +23,7 @@ type Device struct {
 	prevCPU []uint64
 	sizes   map[string]int64
 	sizesAt time.Time
+	pkgs    map[string]bool // all package names, from the last Packages() call
 }
 
 func New(c *adb.Conn) *Device { return &Device{Conn: c} }
@@ -36,22 +38,24 @@ type DeviceInfo struct {
 	Model        string `json:"model"`
 	Android      string `json:"android"`
 	SDK          int    `json:"sdk"`
+	ABI          string `json:"abi"`
 	Address      string `json:"address"`
 	IsTV         bool   `json:"isTv"`
+	Wireless     bool   `json:"wireless"` // connected through "Отладка по Wi-Fi" (TLS)
 }
 
 func (d *Device) Info() (DeviceInfo, error) {
-	out, err := d.sh("getprop ro.product.manufacturer; getprop ro.product.model; getprop ro.build.version.release; getprop ro.build.version.sdk; pm list features 2>/dev/null | grep -c -E 'leanback|android.software.leanback|com.google.android.tv'")
+	out, err := d.sh("getprop ro.product.manufacturer; getprop ro.product.model; getprop ro.build.version.release; getprop ro.build.version.sdk; getprop ro.product.cpu.abi; pm list features 2>/dev/null | grep -c -E 'leanback|android.software.leanback|com.google.android.tv'")
 	if err != nil {
 		return DeviceInfo{}, err
 	}
 	l := lines(out)
-	for len(l) < 5 {
+	for len(l) < 6 {
 		l = append(l, "")
 	}
 	sdk, _ := strconv.Atoi(l[3])
-	n, _ := strconv.Atoi(l[4])
-	return DeviceInfo{Manufacturer: l[0], Model: l[1], Android: l[2], SDK: sdk, Address: d.Conn.Addr(), IsTV: n > 0}, nil
+	n, _ := strconv.Atoi(l[5])
+	return DeviceInfo{Manufacturer: l[0], Model: l[1], Android: l[2], SDK: sdk, ABI: l[4], Address: d.Conn.Addr(), IsTV: n > 0, Wireless: d.Conn.TLS}, nil
 }
 
 func lines(s string) []string {
@@ -132,17 +136,23 @@ func (d *Device) keyboards() map[string]bool {
 
 // Packages lists all packages including ones removed for the user.
 func (d *Device) Packages() ([]Package, error) {
-	all, err := d.sh("pm list packages -u")
+	all, err := d.sh("pm list packages --user 0 -u")
 	if err != nil {
 		return nil, err
 	}
 	if strings.Contains(all, "Error") && !strings.Contains(all, "package:") {
 		return nil, errors.New(strings.TrimSpace(all))
 	}
-	installedOut, _ := d.sh("pm list packages")
-	disabledOut, _ := d.sh("pm list packages -d")
-	thirdOut, _ := d.sh("pm list packages -3")
+	installedOut, err := d.sh("pm list packages --user 0")
+	if err != nil {
+		return nil, err
+	}
+	disabledOut, _ := d.sh("pm list packages --user 0 -d")
+	thirdOut, _ := d.sh("pm list packages --user 0 -3")
 	allSet, installed, disabled, third := pkgSet(all), pkgSet(installedOut), pkgSet(disabledOut), pkgSet(thirdOut)
+	d.mu.Lock()
+	d.pkgs = allSet
+	d.mu.Unlock()
 
 	launchers, def := d.Launchers()
 	lset := map[string]bool{}
@@ -361,7 +371,7 @@ type Stats struct {
 }
 
 func (d *Device) Stats() (Stats, error) {
-	out, err := d.sh("head -1 /proc/stat; echo '@@@'; cat /proc/meminfo; echo '@@@'; df -k /data 2>/dev/null || df /data; echo '@@@'; cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null; echo '@@@'; top -b -n 1 -q -o %CPU,RES,NAME 2>/dev/null")
+	out, err := d.sh("head -1 /proc/stat; echo '@@@'; cat /proc/meminfo; echo '@@@'; df -k /data 2>/dev/null || df /data; echo '@@@'; cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null; echo '@@@'; top -b -n 1 -q -o %CPU,RES,NAME 2>/dev/null")
 	if err != nil {
 		return Stats{}, err
 	}
@@ -421,12 +431,22 @@ func (d *Device) Stats() (Stats, error) {
 			}
 		}
 	}
-	if t, err := strconv.ParseFloat(strings.TrimSpace(parts[3]), 64); err == nil {
+	// Several sensors: show the hottest plausible one.
+	for _, l := range lines(parts[3]) {
+		t, err := strconv.ParseFloat(l, 64)
+		if err != nil {
+			continue
+		}
 		if t > 1000 {
 			t /= 1000
 		}
-		s.TempC = t
+		if t >= 15 && t <= 125 && t > s.TempC {
+			s.TempC = t
+		}
 	}
+	d.mu.Lock()
+	known := d.pkgs
+	d.mu.Unlock()
 	agg := map[string]*Proc{}
 	for _, l := range lines(parts[4]) {
 		ff := strings.Fields(l)
@@ -445,6 +465,19 @@ func (d *Device) Stats() (Stats, error) {
 		}
 		if !pkgLike.MatchString(pkg) {
 			continue
+		}
+		// Fold processes like "com.google.android.gms.persistent" into their package.
+		if len(known) > 0 && !known[pkg] {
+			for q := pkg; ; {
+				i := strings.LastIndex(q, ".")
+				if i < 0 {
+					break
+				}
+				if q = q[:i]; known[q] {
+					pkg = q
+					break
+				}
+			}
 		}
 		p := agg[pkg]
 		if p == nil {
@@ -528,6 +561,16 @@ func (d *Device) Restore(pkgs []string) []Result {
 		ok := strings.Contains(out, "installed for user") || strings.Contains(out2, "enabled")
 		res = append(res, Result{ID: p, OK: ok, Method: "restore", Output: all})
 	}
+	// Trust the real state more than the command output.
+	if insOut, err := d.sh("pm list packages --user 0"); err == nil && strings.Contains(insOut, "package:") {
+		disOut, _ := d.sh("pm list packages --user 0 -d")
+		installed, disabled := pkgSet(insOut), pkgSet(disOut)
+		for i := range res {
+			if validPkg(res[i].ID) {
+				res[i].OK = installed[res[i].ID] && !disabled[res[i].ID]
+			}
+		}
+	}
 	d.mu.Lock()
 	d.sizes = nil
 	d.mu.Unlock()
@@ -600,6 +643,20 @@ func (d *Device) Tweak(action string) (string, error) {
 			return fmt.Sprintf("Кэш очищен, освобождено %d МБ", (after-before)/1024), nil
 		}
 		return "Кэш очищен", nil
+	case "kill_bg":
+		before := d.memAvailKB()
+		out, err := d.sh("am kill-all 2>&1")
+		if err != nil {
+			return "", err
+		}
+		if strings.Contains(out, "Exception") || strings.Contains(out, "Error") {
+			return "", errors.New(strings.TrimSpace(out))
+		}
+		time.Sleep(1200 * time.Millisecond)
+		if after := d.memAvailKB(); before > 0 && after-before >= 1024 {
+			return fmt.Sprintf("Фоновые приложения закрыты, освобождено %d МБ оперативной памяти", (after-before)/1024), nil
+		}
+		return "Фоновые приложения закрыты", nil
 	case "reboot":
 		d.Conn.Shell("reboot", 5*time.Second)
 		return "Телевизор перезагружается", nil
@@ -643,4 +700,118 @@ func (d *Device) Disable(pkgs []string) []Result {
 		res = append(res, Result{ID: p, OK: err == nil && strings.Contains(out, "disabled"), Method: "disable", Output: out})
 	}
 	return res
+}
+
+func (d *Device) memAvailKB() int64 {
+	out, err := d.sh("grep MemAvailable /proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	f := strings.Fields(out)
+	if len(f) < 2 {
+		return 0
+	}
+	v, _ := strconv.ParseInt(f[1], 10, 64)
+	return v
+}
+
+// ForceStop stops one app until it is launched again.
+func (d *Device) ForceStop(pkg string) error {
+	if !validPkg(pkg) {
+		return errors.New("некорректное имя пакета")
+	}
+	out, err := d.sh("am force-stop " + pkg + " 2>&1")
+	if err != nil {
+		return err
+	}
+	if strings.Contains(out, "Exception") || strings.Contains(out, "Error") {
+		return errors.New(strings.TrimSpace(out))
+	}
+	return nil
+}
+
+var installErrors = []struct{ code, text string }{
+	{"NO_MATCHING_ABIS", "приложение собрано для другого процессора и не подходит этому телевизору"},
+	{"OLDER_SDK", "приложению нужна более новая версия Android, чем на телевизоре"},
+	{"INSUFFICIENT_STORAGE", "на телевизоре не хватает свободной памяти"},
+	{"UPDATE_INCOMPATIBLE", "на телевизоре уже стоит версия с другой подписью — сначала удалите её"},
+	{"VERSION_DOWNGRADE", "на телевизоре уже стоит более новая версия"},
+	{"PARSE_FAILED", "файл повреждён или это не APK"},
+	{"INVALID_APK", "файл повреждён или это не APK"},
+	{"VERIFICATION_FAILURE", "установку заблокировала проверка приложений на телевизоре"},
+	{"USER_RESTRICTED", "установка через ADB запрещена в настройках телевизора"},
+}
+
+// InstallAPK uploads an APK and installs it. progress receives bytes sent.
+func (d *Device) InstallAPK(r io.Reader, progress func(sent int64)) error {
+	const tmp = "/data/local/tmp/unbrake_install.apk"
+	if err := d.Conn.Push(tmp, 0o644, r, progress); err != nil {
+		return err
+	}
+	out, err := d.Conn.Shell("pm install -r "+tmp+" 2>&1", 5*time.Minute)
+	d.sh("rm -f " + tmp)
+	if err != nil {
+		return err
+	}
+	d.mu.Lock()
+	d.sizes = nil
+	d.mu.Unlock()
+	out = strings.TrimSpace(out)
+	if strings.Contains(out, "Success") {
+		return nil
+	}
+	for _, e := range installErrors {
+		if strings.Contains(out, e.code) {
+			return errors.New("Не удалось установить: " + e.text + ".")
+		}
+	}
+	if len(out) > 300 {
+		out = out[:300]
+	}
+	return errors.New("Не удалось установить: " + out)
+}
+
+// SetHome makes pkg the default home screen and shows it.
+func (d *Device) SetHome(pkg string) error {
+	if !validPkg(pkg) {
+		return errors.New("некорректное имя пакета")
+	}
+	out, err := d.sh("cmd package query-activities --brief -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null")
+	if err != nil {
+		return err
+	}
+	comp := ""
+	for _, l := range lines(out) {
+		if strings.HasPrefix(l, pkg+"/") && !strings.Contains(l, " ") {
+			comp = l
+			break
+		}
+	}
+	if comp == "" {
+		return errors.New("это приложение не установлено или не умеет быть рабочим столом")
+	}
+	out, err = d.sh("cmd package set-home-activity " + comp + " 2>&1")
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(out, "Success") {
+		return errors.New("Прошивка не разрешила сменить рабочий стол командой. Нажмите «Домой» на пульте и выберите новый рабочий стол, либо отключите стандартный на вкладке «Приложения».")
+	}
+	d.sh("am start -a android.intent.action.MAIN -c android.intent.category.HOME 2>&1")
+	return nil
+}
+
+// OpenStore opens the Play Store page of pkg on the TV screen.
+func (d *Device) OpenStore(pkg string) error {
+	if !validPkg(pkg) {
+		return errors.New("некорректное имя пакета")
+	}
+	out, err := d.sh("am start -a android.intent.action.VIEW -d 'market://details?id=" + pkg + "' 2>&1")
+	if err != nil {
+		return err
+	}
+	if strings.Contains(out, "Error") || strings.Contains(out, "Exception") {
+		return errors.New("На телевизоре не открылся Play Маркет — возможно, он удалён или отключён.")
+	}
+	return nil
 }
