@@ -18,6 +18,7 @@
   <button id="btnDisconnect" class="ghost hidden">Отключиться</button>
   <button id="btnQuit" class="ghost">Выход</button>
 </header>
+<div id="updateBanner" class="banner hidden"></div>
 
 <!-- ===== Подключение ===== -->
 <main id="connectView" class="view">
@@ -37,27 +38,42 @@
         <button class="primary" type="submit">Подключиться</button>
       </form>
       <div id="connectStatus" class="status hidden"></div>
+      <div id="recentBox" class="recent hidden"></div>
+      <div class="altlinks">
+        <button id="btnPair" class="linkbtn" type="button"><b>Сопряжение по коду</b> — если на телевизоре только «Отладка по Wi-Fi» (Android 11+)</button>
+        <button id="btnDemo" class="linkbtn" type="button"><b>Демо-режим</b> — посмотреть программу без телевизора</button>
+      </div>
     </section>
 
     <section class="card help">
       <h2>Подготовка телевизора</h2>
       <ol>
         <li>Настройки → Об устройстве → 7 раз нажмите на <b>«Сборка»</b>, чтобы включить режим разработчика.</li>
-        <li>В разделе <b>«Для разработчиков»</b> включите <b>«Отладка по USB»</b> (или «Отладка по сети»).</li>
+        <li>В разделе <b>«Для разработчиков»</b> включите <b>«Отладка по USB»</b> (или «Отладка по сети»). Если есть только <b>«Отладка по Wi-Fi»</b> — включите её и нажмите слева «Сопряжение по коду».</li>
         <li>Компьютер и телевизор должны быть в одной сети.</li>
         <li>При первом подключении на экране ТВ появится запрос — отметьте <b>«Всегда разрешать»</b> и нажмите OK.</li>
       </ol>
       <p class="muted small">Работает с телевизорами и приставками на Android TV и Google TV: Xiaomi, Sony, TCL, Philips, Haier, Hisense (Android), Mi Box, Chromecast и др. Samsung (Tizen) и LG (webOS) не поддерживают удаление системных приложений.</p>
     </section>
   </div>
+  <footer class="foot">
+    <span id="verInfo"></span>
+    <label class="chk"><input type="checkbox" id="updChk"> проверять обновления при запуске</label>
+    <button id="btnCheckUpd" class="linkbtn" type="button">Проверить сейчас</button>
+  </footer>
 </main>
 
 <!-- ===== Основной экран ===== -->
 <main id="mainView" class="view hidden">
+  <div id="demoBanner" class="banner demo hidden">
+    <span><b>Демо-режим.</b> Это встроенный эмулятор телевизора Xiaomi: пробуйте всё что угодно — настоящие устройства не затрагиваются, журнал не сохраняется.</span>
+    <button id="btnDemoExit" class="ghost small-btn">Выйти из демо</button>
+  </div>
   <nav class="tabs">
     <button data-tab="overview" class="active">Нагрузка</button>
     <button data-tab="apps">Приложения <span id="recCount" class="pill hidden"></span></button>
     <button data-tab="removed">Удалённые <span id="remCount" class="pill gray hidden"></span></button>
+    <button data-tab="install">Установка</button>
     <button data-tab="history">Журнал</button>
   </nav>
 
@@ -69,6 +85,7 @@
       <div class="metric"><div class="mlabel">Память устройства</div><div class="mval" id="mStor">—</div><div class="bar"><i id="bStor"></i></div><div class="msub" id="sStor"></div></div>
       <div class="metric"><div class="mlabel">Температура</div><div class="mval" id="mTemp">—</div><div class="msub" id="sTemp"></div></div>
     </div>
+    <div id="sessionCard" class="card session hidden"></div>
     <div class="card">
       <div class="cardhead"><h2>Нагрузка за последние 2 минуты</h2>
         <div class="legend"><span class="lg cpu"></span>Процессор <span class="lg mem"></span>Память</div></div>
@@ -76,7 +93,7 @@
     </div>
     <div class="card">
       <div class="cardhead"><h2>Что сейчас нагружает телевизор</h2><span class="muted small">обновляется каждые 2 секунды</span></div>
-      <table class="tbl"><thead><tr><th>Приложение</th><th>Оценка</th><th class="num">Процессор</th><th class="num">Память</th></tr></thead>
+      <table class="tbl"><thead><tr><th>Приложение</th><th>Оценка</th><th class="num">Процессор</th><th class="num">Память</th><th></th></tr></thead>
       <tbody id="topBody"></tbody></table>
     </div>
     <div id="advice" class="card advice hidden"></div>
@@ -92,7 +109,11 @@
           <button class="ghost" data-tweak="trim_caches">Очистить</button>
         </div>
         <div class="tweak">
-          <div><b>Перезагрузить телевизор</b><div class="muted small">Нужно после удаления, чтобы освободить оперативную память.</div></div>
+          <div><b>Закрыть фоновые приложения</b><div class="muted small">Освобождает оперативную память прямо сейчас, без перезагрузки. Открытое приложение не закрывается.</div></div>
+          <button class="ghost" data-tweak="kill_bg">Закрыть</button>
+        </div>
+        <div class="tweak">
+          <div><b>Перезагрузить телевизор</b><div class="muted small">Нужно после удаления, чтобы освободить оперативную память. Программа подключится снова сама.</div></div>
           <button class="ghost" data-tweak="reboot">Перезагрузить</button>
         </div>
         <div class="tweak">
@@ -116,8 +137,10 @@
       </div>
       <input id="search" placeholder="Поиск по названию или пакету" spellcheck="false">
       <label class="chk"><input type="checkbox" id="onlyRunning"> только запущенные</label>
+      <button class="primary small-btn" id="btnPresets" title="Отметить приложения по готовому списку для вашей модели">Готовые профили</button>
       <button class="ghost small-btn" id="btnExport" title="Сохранить список удалённого, чтобы повторить на другом ТВ">Экспорт профиля</button>
       <button class="ghost small-btn" id="btnImport" title="Отметить приложения из сохранённого профиля">Импорт профиля</button>
+      <button class="ghost small-btn" id="btnReport" title="Сохранить список всех приложений телевизора — его можно приложить к сообщению об ошибке, чтобы пополнить базу знаний">Отчёт о ТВ</button>
       <input type="file" id="importFile" accept=".json,application/json" class="hidden">
     </div>
     <div class="legendbox">
@@ -148,6 +171,24 @@
       <tbody id="remBody"></tbody></table>
       <div id="remEmpty" class="empty hidden">Пока ничего не удалено</div>
     </div>
+  </section>
+
+  <!-- Установка -->
+  <section id="tab-install" class="tab hidden">
+    <div class="card">
+      <div class="cardhead"><h2>Лёгкий рабочий стол</h2><span class="muted small" id="curLauncher"></span></div>
+      <p class="muted">Заводская оболочка с рекламой и рекомендациями — главный источник тормозов. Поставьте лёгкий рабочий стол, сделайте его основным, а заводской потом удалите или отключите на вкладке «Приложения».</p>
+      <div id="launcherList" class="launchers"></div>
+      <div id="installedLaunchers"></div>
+      <p class="muted small">Установочный файл скачивается с официальной страницы разработчика на GitHub в тот момент, когда вы нажимаете «Установить», и сразу передаётся на телевизор.</p>
+    </div>
+    <div class="card">
+      <h2>Установить приложение из APK-файла</h2>
+      <p class="muted">Любое приложение для Android TV, которого нет в магазине: выберите APK-файл на компьютере, программа передаст его на телевизор и установит.</p>
+      <button class="ghost" id="btnApk">Выбрать APK-файл…</button>
+      <input type="file" id="apkFile" accept=".apk,application/vnd.android.package-archive" class="hidden">
+    </div>
+    <div id="installProgress" class="status hidden"></div>
   </section>
 
   <!-- Журнал -->
