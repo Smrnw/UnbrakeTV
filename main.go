@@ -21,11 +21,13 @@ import (
 	"github.com/Smrnw/UnbrakeTV/internal/web"
 )
 
-var version = "1.0.0"
+var version = "1.1.0"
 
 func main() {
 	port := flag.Int("port", 0, "порт веб-интерфейса (0 — случайный)")
 	noBrowser := flag.Bool("no-browser", false, "не открывать браузер автоматически")
+	demo := flag.Bool("demo", false, "демо-режим: сразу подключиться к встроенному эмулятору телевизора")
+	noUpdate := flag.Bool("no-update-check", false, "не проверять наличие новой версии при запуске")
 	flag.Parse()
 
 	dir, err := os.UserConfigDir()
@@ -33,12 +35,22 @@ func main() {
 		dir = "."
 	}
 	dataDir := filepath.Join(dir, "UnbrakeTV")
-	os.MkdirAll(dataDir, 0o700)
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		log.Fatal("не удалось создать папку настроек: ", err)
+	}
 	migrateFromTVClean(filepath.Join(dir, "TVClean"), dataDir)
 
 	srv, err := app.New(dataDir, version)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if !*noUpdate {
+		srv.AutoCheckUpdate()
+	}
+	if *demo {
+		if err := srv.ConnectDemo(); err != nil {
+			log.Fatal(err)
+		}
 	}
 	sub, _ := fs.Sub(web.Files, "static")
 	h := srv.Handler(http.FileServer(http.FS(sub)))

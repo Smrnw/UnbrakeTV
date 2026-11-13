@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/rsa"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -31,6 +33,7 @@ const (
 	authRSAPublicKey = 3
 
 	protoVersion = 0x01000000
+	tlsVersion   = 0x01000000
 	maxPayload   = 256 * 1024
 )
 
@@ -38,7 +41,7 @@ const (
 var ErrAuthRejected = errors.New("телевизор не подтвердил подключение")
 
 // ErrNeedsPairing is returned when the device requires TLS (wireless debugging pairing).
-var ErrNeedsPairing = errors.New("устройство требует сопряжения по коду (беспроводная отладка Android 11+), этот режим пока не поддерживается — включите обычную отладку по USB/сети")
+var ErrNeedsPairing = errors.New("телевизор использует «Отладку по Wi-Fi» и ещё не знает этот компьютер — выполните сопряжение по коду")
 
 type message struct {
 	cmd, arg0, arg1 uint32
@@ -49,11 +52,13 @@ type message struct {
 // commands are executed one at a time.
 type Conn struct {
 	mu      sync.Mutex
-	c       net.Conn
+	raw     net.Conn // the TCP socket
+	c       net.Conn // raw, or TLS on top of it (wireless debugging)
 	nextID  uint32
 	Banner  string
+	TLS     bool
 	maxData uint32
-	closed  bool
+	closed  atomic.Bool
 	addr    string
 }
 
@@ -63,14 +68,14 @@ type OnAuthPrompt func()
 // Dial connects to addr (host:port) and performs the handshake.
 // authWait is how long to wait for the user to confirm the dialog on the TV.
 func Dial(addr string, key *rsa.PrivateKey, authWait time.Duration, prompt OnAuthPrompt) (*Conn, error) {
-	if !strings.Contains(addr, ":") {
-		addr += ":5555"
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		addr = net.JoinHostPort(addr, "5555")
 	}
 	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("не удалось подключиться к %s: %w", addr, err)
 	}
-	a := &Conn{c: c, nextID: 1, maxData: maxPayload, addr: addr}
+	a := &Conn{raw: c, c: c, nextID: 1, maxData: maxPayload, addr: addr}
 	if err := a.handshake(key, authWait, prompt); err != nil {
 		c.Close()
 		return nil, err
@@ -95,6 +100,10 @@ func (a *Conn) handshake(key *rsa.PrivateKey, authWait time.Duration, prompt OnA
 					return ErrAuthRejected
 				}
 			}
+			if a.TLS {
+				// TLS 1.3: the TV rejects an unknown key only after the handshake.
+				return ErrNeedsPairing
+			}
 			return fmt.Errorf("ошибка рукопожатия ADB: %w", err)
 		}
 		switch m.cmd {
@@ -106,7 +115,22 @@ func (a *Conn) handshake(key *rsa.PrivateKey, authWait time.Duration, prompt OnA
 			a.c.SetDeadline(time.Time{})
 			return nil
 		case cmdSTLS:
-			return ErrNeedsPairing
+			// Wireless debugging: switch to TLS, the key is checked there.
+			if a.TLS {
+				return errors.New("ошибка рукопожатия ADB: повторный запрос TLS")
+			}
+			cfg, err := clientTLSConfig(key)
+			if err != nil {
+				return err
+			}
+			if err := a.send(cmdSTLS, tlsVersion, 0, nil); err != nil {
+				return err
+			}
+			tc := tls.Client(a.raw, cfg)
+			if err := tc.Handshake(); err != nil {
+				return ErrNeedsPairing
+			}
+			a.c, a.TLS = tc, true
 		case cmdAUTH:
 			if m.arg0 != authToken {
 				continue
@@ -190,77 +214,209 @@ func (a *Conn) read() (*message, error) {
 	return m, nil
 }
 
+// stream is one open ADB service (shell:, sync:). The caller holds a.mu.
+type stream struct {
+	a             *Conn
+	local, remote uint32
+	in            bytes.Buffer
+	ready, eof    bool
+}
+
+var errRefused = errors.New("телевизор отказал в выполнении команды")
+
+func (a *Conn) open(service string) (*stream, error) {
+	s := &stream{a: a, local: a.nextID}
+	a.nextID++
+	if err := a.send(cmdOPEN, s.local, 0, []byte(service+"\x00")); err != nil {
+		a.fail()
+		return nil, err
+	}
+	for s.remote == 0 && !s.eof {
+		if err := s.pump(); err != nil {
+			return nil, err
+		}
+	}
+	if s.remote == 0 {
+		return nil, errRefused
+	}
+	return s, nil
+}
+
+// pump reads and handles one message from the device.
+func (s *stream) pump() error {
+	a := s.a
+	m, err := a.read()
+	if err != nil {
+		a.fail()
+		return fmt.Errorf("связь с телевизором потеряна: %w", err)
+	}
+	if m.arg1 != s.local {
+		// Stale message from an older stream: acknowledge writes and move on.
+		if m.cmd == cmdWRTE {
+			a.send(cmdOKAY, m.arg1, m.arg0, nil)
+		}
+		return nil
+	}
+	switch m.cmd {
+	case cmdOKAY:
+		s.remote, s.ready = m.arg0, true
+	case cmdWRTE:
+		s.remote = m.arg0
+		s.in.Write(m.data)
+		if err := a.send(cmdOKAY, s.local, s.remote, nil); err != nil {
+			a.fail()
+			return err
+		}
+	case cmdCLSE:
+		if s.remote != 0 {
+			a.send(cmdCLSE, s.local, s.remote, nil)
+		}
+		s.eof = true
+	}
+	return nil
+}
+
+// write sends p to the device, waiting for the acknowledgement of every chunk.
+func (s *stream) write(p []byte) error {
+	for len(p) > 0 {
+		n := min(len(p), int(s.a.maxData))
+		s.ready = false
+		if err := s.a.send(cmdWRTE, s.local, s.remote, p[:n]); err != nil {
+			s.a.fail()
+			return err
+		}
+		p = p[n:]
+		for !s.ready && !s.eof {
+			if err := s.pump(); err != nil {
+				return err
+			}
+		}
+		if s.eof {
+			return errors.New("телевизор закрыл поток")
+		}
+	}
+	return nil
+}
+
+func (s *stream) readN(n int) ([]byte, error) {
+	for s.in.Len() < n && !s.eof {
+		if err := s.pump(); err != nil {
+			return nil, err
+		}
+	}
+	if s.in.Len() < n {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return append([]byte(nil), s.in.Next(n)...), nil
+}
+
 // Shell runs a command on the device and returns its combined output.
 func (a *Conn) Shell(cmd string, timeout time.Duration) (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.closed {
+	if a.closed.Load() {
 		return "", errors.New("соединение закрыто")
 	}
 	a.c.SetDeadline(time.Now().Add(timeout))
 	defer a.c.SetDeadline(time.Time{})
 
-	local := a.nextID
-	a.nextID++
-	if err := a.send(cmdOPEN, local, 0, []byte("shell:"+cmd+"\x00")); err != nil {
-		a.fail()
+	s, err := a.open("shell:" + cmd)
+	if err != nil {
 		return "", err
 	}
-	var out bytes.Buffer
-	var remote uint32
-	for {
-		m, err := a.read()
-		if err != nil {
-			a.fail()
-			return out.String(), fmt.Errorf("связь с телевизором потеряна: %w", err)
-		}
-		if m.arg1 != local {
-			// Stale message from an older stream: acknowledge writes and move on.
-			if m.cmd == cmdWRTE {
-				a.send(cmdOKAY, m.arg1, m.arg0, nil)
-			}
-			continue
-		}
-		switch m.cmd {
-		case cmdOKAY:
-			remote = m.arg0
-		case cmdWRTE:
-			remote = m.arg0
-			out.Write(m.data)
-			if err := a.send(cmdOKAY, local, remote, nil); err != nil {
-				a.fail()
-				return out.String(), err
-			}
-		case cmdCLSE:
-			if remote != 0 {
-				a.send(cmdCLSE, local, remote, nil)
-			}
-			if remote == 0 && out.Len() == 0 {
-				return "", errors.New("телевизор отказал в выполнении команды")
-			}
-			return out.String(), nil
+	for !s.eof {
+		if err := s.pump(); err != nil {
+			return s.in.String(), err
 		}
 	}
+	return s.in.String(), nil
+}
+
+// Push uploads a file to the device over the sync service.
+// progress (optional) receives the number of bytes sent so far.
+func (a *Conn) Push(path string, mode uint32, r io.Reader, progress func(sent int64)) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed.Load() {
+		return errors.New("соединение закрыто")
+	}
+	const idle = 60 * time.Second
+	a.c.SetDeadline(time.Now().Add(idle))
+	defer a.c.SetDeadline(time.Time{})
+
+	s, err := a.open("sync:")
+	if err != nil {
+		return err
+	}
+	pkt := func(id string, n uint32, data []byte) []byte {
+		b := make([]byte, 8, 8+len(data))
+		copy(b, id)
+		binary.LittleEndian.PutUint32(b[4:], n)
+		return append(b, data...)
+	}
+	spec := []byte(fmt.Sprintf("%s,%d", path, mode))
+	if err := s.write(pkt("SEND", uint32(len(spec)), spec)); err != nil {
+		return err
+	}
+	buf := make([]byte, 64*1024)
+	var sent int64
+	for {
+		n, rerr := io.ReadFull(r, buf)
+		if n > 0 {
+			a.c.SetDeadline(time.Now().Add(idle))
+			if err := s.write(pkt("DATA", uint32(n), buf[:n])); err != nil {
+				return err
+			}
+			sent += int64(n)
+			if progress != nil {
+				progress(sent)
+			}
+		}
+		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
+			break
+		}
+		if rerr != nil {
+			// The transfer is half done: the stream cannot be reused.
+			a.fail()
+			return rerr
+		}
+	}
+	a.c.SetDeadline(time.Now().Add(idle))
+	if err := s.write(pkt("DONE", uint32(time.Now().Unix()), nil)); err != nil {
+		return err
+	}
+	resp, err := s.readN(8)
+	if err != nil {
+		return fmt.Errorf("телевизор не подтвердил запись файла: %w", err)
+	}
+	if string(resp[:4]) != "OKAY" {
+		msg, _ := s.readN(int(binary.LittleEndian.Uint32(resp[4:])))
+		return fmt.Errorf("телевизор не принял файл: %s", strings.TrimSpace(string(msg)))
+	}
+	if err := s.write(pkt("QUIT", 0, nil)); err != nil {
+		return nil // the file is already written
+	}
+	for !s.eof {
+		if s.pump() != nil {
+			break
+		}
+	}
+	return nil
 }
 
 func (a *Conn) fail() {
-	a.closed = true
-	a.c.Close()
+	a.closed.Store(true)
+	a.raw.Close()
 }
 
 // Alive reports whether the connection is still usable.
-func (a *Conn) Alive() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return !a.closed
-}
+// It never blocks, even while a long command is running.
+func (a *Conn) Alive() bool { return !a.closed.Load() }
 
-// Close closes the connection.
+// Close closes the connection. A command in flight is interrupted.
 func (a *Conn) Close() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.closed = true
-	return a.c.Close()
+	a.closed.Store(true)
+	return a.raw.Close()
 }
 
 // Probe checks that addr really speaks ADB: it sends CNXN and expects a valid
@@ -274,7 +430,7 @@ func Probe(ctx context.Context, addr string, timeout time.Duration) bool {
 	}
 	defer c.Close()
 	c.SetDeadline(time.Now().Add(timeout + 1500*time.Millisecond))
-	a := &Conn{c: c}
+	a := &Conn{raw: c, c: c}
 	if err := a.send(cmdCNXN, protoVersion, maxPayload, []byte("host::unbraketv\x00")); err != nil {
 		return false
 	}

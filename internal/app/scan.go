@@ -13,8 +13,9 @@ import (
 
 // Found is a device in the local network with the ADB port open.
 type Found struct {
-	Address string `json:"address"`
-	Name    string `json:"name"`
+	Address  string `json:"address"`
+	Name     string `json:"name"`
+	Wireless bool   `json:"wireless"` // found over mDNS: "Отладка по Wi-Fi"
 }
 
 // Scan probes TCP 5555 on every host of the local /24 networks.
@@ -52,10 +53,15 @@ func Scan(ctx context.Context) []Found {
 
 	var mu sync.Mutex
 	var found []Found
-	sem := make(chan struct{}, 128)
+	// Computers with VPN, WSL, Docker or VM adapters have many private networks;
+	// a wide fan-out keeps the whole scan within the time limit.
+	sem := make(chan struct{}, 384)
 	var wg sync.WaitGroup
 	d := net.Dialer{Timeout: 700 * time.Millisecond}
 	for _, t := range targets {
+		if ctx.Err() != nil {
+			break
+		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(ip net.IP) {
