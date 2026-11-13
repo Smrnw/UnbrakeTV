@@ -191,8 +191,36 @@ var rules = []rule{
 // telemetryHints catch unknown system packages that look like ads/telemetry.
 var telemetryHints = []string{"analytics", "statistic", "telemetry", "tracker", "advert", ".ads.", "demo", "retail", "feedback"}
 
+// overlay lets an optional part of the program refine a built-in verdict
+// (see knowledge_remote.go).
+var overlay func(pkg string, base Info, exact bool) Info
+
 // Lookup returns what we know about pkg. thirdParty marks user-installed apps.
 func Lookup(pkg string, thirdParty bool) Info {
+	base, exact := builtinRule(pkg, thirdParty)
+	if overlay != nil {
+		return overlay(pkg, base, exact)
+	}
+	return base
+}
+
+func builtin(pkg string, thirdParty bool) Info {
+	inf, _ := builtinRule(pkg, thirdParty)
+	return inf
+}
+
+// builtinRule also reports whether the verdict comes from an entry written
+// for exactly this package (as opposed to a vendor-wide wildcard or a guess).
+func builtinRule(pkg string, thirdParty bool) (Info, bool) {
+	for _, ru := range rules {
+		if ru.pattern == pkg {
+			return ru.Info, true
+		}
+	}
+	return builtinGuess(pkg, thirdParty), false
+}
+
+func builtinGuess(pkg string, thirdParty bool) Info {
 	for _, ru := range rules {
 		if matches(ru.pattern, pkg) {
 			inf := ru.Info

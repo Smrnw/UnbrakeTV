@@ -24,6 +24,11 @@ type Device struct {
 	sizes   map[string]int64
 	sizesAt time.Time
 	pkgs    map[string]bool // all package names, from the last Packages() call
+	caches  map[string]int64
+	storage Storage
+
+	// SDK is the Android API level, filled in by Info().
+	SDK int
 }
 
 func New(c *adb.Conn) *Device { return &Device{Conn: c} }
@@ -39,23 +44,25 @@ type DeviceInfo struct {
 	Android      string `json:"android"`
 	SDK          int    `json:"sdk"`
 	ABI          string `json:"abi"`
+	Serial       string `json:"serial"`
 	Address      string `json:"address"`
 	IsTV         bool   `json:"isTv"`
 	Wireless     bool   `json:"wireless"` // connected through "Отладка по Wi-Fi" (TLS)
 }
 
 func (d *Device) Info() (DeviceInfo, error) {
-	out, err := d.sh("getprop ro.product.manufacturer; getprop ro.product.model; getprop ro.build.version.release; getprop ro.build.version.sdk; getprop ro.product.cpu.abi; pm list features 2>/dev/null | grep -c -E 'leanback|android.software.leanback|com.google.android.tv'")
+	out, err := d.sh("getprop ro.product.manufacturer; getprop ro.product.model; getprop ro.build.version.release; getprop ro.build.version.sdk; getprop ro.product.cpu.abi; getprop ro.serialno; pm list features 2>/dev/null | grep -c -E 'leanback|android.software.leanback|com.google.android.tv'")
 	if err != nil {
 		return DeviceInfo{}, err
 	}
 	l := lines(out)
-	for len(l) < 6 {
+	for len(l) < 7 {
 		l = append(l, "")
 	}
 	sdk, _ := strconv.Atoi(l[3])
-	n, _ := strconv.Atoi(l[5])
-	return DeviceInfo{Manufacturer: l[0], Model: l[1], Android: l[2], SDK: sdk, ABI: l[4], Address: d.Conn.Addr(), IsTV: n > 0, Wireless: d.Conn.TLS}, nil
+	n, _ := strconv.Atoi(l[6])
+	d.SDK = sdk
+	return DeviceInfo{Manufacturer: l[0], Model: l[1], Android: l[2], SDK: sdk, ABI: l[4], Serial: l[5], Address: d.Conn.Addr(), IsTV: n > 0, Wireless: d.Conn.TLS}, nil
 }
 
 func lines(s string) []string {
@@ -91,6 +98,7 @@ type Package struct {
 	System            bool    `json:"system"`
 	State             string  `json:"state"` // installed | disabled | removed
 	SizeBytes         int64   `json:"sizeBytes"`
+	CacheBytes        int64   `json:"cacheBytes"`
 	MemKB             int64   `json:"memKb"`
 	CPU               float64 `json:"cpu"`
 	Running           bool    `json:"running"`
@@ -190,7 +198,7 @@ func (d *Device) Packages() ([]Package, error) {
 			st = "disabled"
 		}
 		inf := Lookup(p, third[p])
-		pk := Package{ID: p, Info: inf, System: !third[p], State: st, SizeBytes: sizes[p]}
+		pk := Package{ID: p, Info: inf, System: !third[p], State: st, SizeBytes: sizes[p], CacheBytes: d.cacheOf(p)}
 		if u, ok := procs[p]; ok {
 			pk.MemKB, pk.CPU, pk.Running = u.memKB, u.cpu, true
 		}
@@ -264,13 +272,21 @@ func (d *Device) packageSizes() map[string]int64 {
 		}
 		return 0
 	}
+	caches := map[string]int64{}
 	for i, n := range names {
 		res[n] = at(app, i) + at(data, i) + at(cache, i)
+		caches[n] = at(cache, i)
 	}
 	d.mu.Lock()
-	d.sizes, d.sizesAt = res, time.Now()
+	d.sizes, d.sizesAt, d.caches, d.storage = res, time.Now(), caches, parseStorage(out)
 	d.mu.Unlock()
 	return res
+}
+
+func (d *Device) cacheOf(pkg string) int64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.caches[pkg]
 }
 
 type usage struct {
@@ -366,20 +382,25 @@ type Stats struct {
 	StorTotalKB int64   `json:"storTotalKb"`
 	StorUsedKB  int64   `json:"storUsedKb"`
 	TempC       float64 `json:"tempC"`
+	UptimeSec   int64   `json:"uptimeSec"`
 	Top         []Proc  `json:"top"`
 	Time        int64   `json:"time"`
 }
 
 func (d *Device) Stats() (Stats, error) {
-	out, err := d.sh("head -1 /proc/stat; echo '@@@'; cat /proc/meminfo; echo '@@@'; df -k /data 2>/dev/null || df /data; echo '@@@'; cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null; echo '@@@'; top -b -n 1 -q -o %CPU,RES,NAME 2>/dev/null")
+	out, err := d.sh("head -1 /proc/stat; echo '@@@'; cat /proc/meminfo; echo '@@@'; df -k /data 2>/dev/null || df /data; echo '@@@'; cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null; echo '@@@'; top -b -n 1 -q -o %CPU,RES,NAME 2>/dev/null; echo '@@@'; cat /proc/uptime 2>/dev/null")
 	if err != nil {
 		return Stats{}, err
 	}
 	parts := strings.Split(out, "@@@")
-	for len(parts) < 5 {
+	for len(parts) < 6 {
 		parts = append(parts, "")
 	}
 	s := Stats{Time: time.Now().UnixMilli()}
+	if f := strings.Fields(parts[5]); len(f) > 0 {
+		up, _ := strconv.ParseFloat(f[0], 64)
+		s.UptimeSec = int64(up)
+	}
 
 	// CPU from /proc/stat delta between two polls
 	f := strings.Fields(parts[0])
@@ -586,12 +607,24 @@ func ValidPackage(p string) bool { return validPkg(p) }
 
 // TweakState is the current state of quick tweaks.
 type TweakState struct {
-	AnimScale string `json:"animScale"` // "1", "0.5", "0" or "mixed"
+	AnimScale    string `json:"animScale"`    // "1", "0.5", "0" or "mixed"
+	ProcLimit    string `json:"procLimit"`    // "default", a number, or "unsupported"
+	Screensaver  bool   `json:"screensaver"`  // the idle screensaver is enabled
+	DNS          string `json:"dns"`          // filtering DNS host, "" when off
+	DNSSupported bool   `json:"dnsSupported"` // Private DNS exists on this Android
 }
 
 var animKeys = []string{"window_animation_scale", "transition_animation_scale", "animator_duration_scale"}
 
 func (d *Device) Tweaks() TweakState {
+	t := TweakState{AnimScale: d.animScale()}
+	if extraTweakState != nil {
+		extraTweakState(d, &t)
+	}
+	return t
+}
+
+func (d *Device) animScale() string {
 	vals := map[string]bool{}
 	for _, k := range animKeys {
 		out, _ := d.sh("settings get global " + k)
@@ -606,10 +639,10 @@ func (d *Device) Tweaks() TweakState {
 	}
 	if len(vals) == 1 {
 		for v := range vals {
-			return TweakState{AnimScale: v}
+			return v
 		}
 	}
-	return TweakState{AnimScale: "mixed"}
+	return "mixed"
 }
 
 // Tweak applies a quick, reversible optimisation.
@@ -621,6 +654,9 @@ func (d *Device) Tweak(action string) (string, error) {
 		}
 		_, err := d.sh(strings.Join(cmds, "; "))
 		return "Скорость анимаций изменена", err
+	}
+	if f, ok := extraTweakActions[action]; ok {
+		return f(d)
 	}
 	switch action {
 	case "anim_fast":
@@ -815,3 +851,10 @@ func (d *Device) OpenStore(pkg string) error {
 	}
 	return nil
 }
+
+// Optional tweaks register themselves here, so that the core list above
+// stays small and each addition lives in its own file.
+var (
+	extraTweakState   func(d *Device, t *TweakState)
+	extraTweakActions = map[string]func(d *Device) (string, error){}
+)

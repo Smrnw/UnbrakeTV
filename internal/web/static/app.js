@@ -20,6 +20,18 @@ const S = {
   launchers: null, updateDismissed: false, pairPrefill: "",
 };
 
+// Optional parts of the program (separate files) plug in here.
+const afterConnect = [];   // run once the app list of a newly connected TV is loaded
+const afterPackages = [];  // run after every reload of the app list
+const tabHooks = {};       // tab name → functions to run when the tab opens
+const tipHooks = [];       // add advice to "Что можно улучшить": (stats, tips) => …
+function moreCell() { return ""; }                 // extra cell in the apps table
+function methodExtra() { return ""; }              // extra ways to remove in the dialog
+function backupNote(n) {                           // what happens to user-installed apps
+  return `<p class="small muted">Приложения, установленные вами (${n}), удалятся полностью — вернуть их можно будет только из Play Маркета.</p>`;
+}
+function stateText(p) { return p.state === "removed" ? "удалено" : "отключено"; }
+
 async function api(path, body, raw) {
   const opt = { method: body ? "POST" : "GET", headers: { "X-Token": TOKEN } };
   if (raw) { opt.body = body; Object.assign(opt.headers, raw); }
@@ -70,7 +82,9 @@ async function pollState() {
   try { s = await api("/api/state"); }
   catch (e) { renderStatus({ status: "error", error: "Программа не отвечает. Перезапустите Unbrake TV." }); return; }
   const prev = S.status;
-  S.status = s.status; S.device = s.device; S.demo = !!s.demo; S.version = s.version;
+  S.status = s.status; S.device = s.device; S.demo = !!s.demo; S.version = s.version; S.knowledge = s.knowledge || {};
+  if (s.status === "rebooting") S.rebootPending = true;
+  else if (s.status === "idle" || s.status === "error") S.rebootPending = false;
   if (!$("addr").value && s.lastAddress && document.activeElement !== $("addr")) $("addr").value = s.lastAddress.replace(/:5555$/, "");
   renderStatus(s);
   renderRecent(s.recent || []);
@@ -220,7 +234,7 @@ function onConnected() {
   S.selected.clear(); S.selectedRem.clear(); S.packages = []; S.launchers = null;
   $("sessionCard").classList.add("hidden");
   switchTab("overview");
-  loadPackages();
+  loadPackages().then(() => afterConnect.forEach((f) => f()));
   loadTweaks();
   clearInterval(S.statsTimer);
   S.statsTimer = setInterval(loadStats, 2000);
@@ -286,6 +300,7 @@ function switchTab(t) {
   document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("hidden", x.id !== "tab-" + t));
   if (t === "history") loadHistory();
   if (t === "install") loadLaunchers();
+  (tabHooks[t] || []).forEach((f) => f());
   if (t === "overview") requestAnimationFrame(drawChart);
   renderActionbar();
 }
@@ -293,7 +308,7 @@ function switchTab(t) {
 // ---------------- Нагрузка ----------------
 const chartData = [];
 async function loadStats() {
-  if (S.status !== "connected" || document.hidden || S.statsBusy) return;
+  if (S.status !== "connected" || (document.hidden && (S.range || 60) === 60) || S.statsBusy) return;
   S.statsBusy = true;
   let s;
   try { s = await api("/api/stats"); }
@@ -302,8 +317,8 @@ async function loadStats() {
   if (S.status !== "connected") return;
   const memUsed = s.memTotalKb ? 100 * (1 - s.memAvailKb / s.memTotalKb) : 0;
   const stor = s.storTotalKb ? (100 * s.storUsedKb) / s.storTotalKb : 0;
-  if (chartData.length || s.cpu > 0) chartData.push({ cpu: s.cpu, mem: memUsed });
-  if (chartData.length > 60) chartData.shift();
+  if (chartData.length || s.cpu > 0) chartData.push({ cpu: s.cpu, mem: memUsed, t: Date.now() });
+  if (chartData.length > 1800) chartData.shift();
 
   setMetric("Cpu", s.cpu, s.cpu.toFixed(0) + "%", 60, 85);
   setMetric("Mem", memUsed, memUsed.toFixed(0) + "%", 75, 90);
@@ -375,6 +390,7 @@ function renderAdvice(s, mem, stor) {
   if (recRunning.length) tips.push(`Сейчас в фоне работает <b>${recRunning.length}</b> ${plural(recRunning.length, "ненужное приложение", "ненужных приложения", "ненужных приложений")} из списка «Рекомендуем удалить» — они занимают около <b>${fmtKB(recMem)}</b> памяти.`);
   if (mem > 80) tips.push("Оперативная память почти заполнена — это главная причина тормозов. Удаление фоновых приложений поможет сильнее всего.");
   if (stor > 85) tips.push("Внутренняя память почти заполнена — система будет тормозить. Удалите неиспользуемые приложения или очистите их кэш.");
+  tipHooks.forEach((f) => f(s, tips));
   if (rec.length && !recRunning.length) tips.push(`Найдено <b>${rec.length}</b> ${plural(rec.length, "приложение, которое", "приложения, которые", "приложений, которые")} безопасно удалить.`);
   const el = $("advice");
   if (!tips.length) { el.classList.add("hidden"); return; }
@@ -402,11 +418,12 @@ function drawChart() {
     g.beginPath(); g.moveTo(pad.l, y); g.lineTo(w - pad.r, y); g.stroke();
     g.fillText(v + "%", 2, y + 4);
   }
+  const N = S.range || 60, data = chartData.slice(-N);
   const line = (key, color) => {
-    if (chartData.length < 2) return;
-    g.strokeStyle = color; g.lineWidth = 2; g.beginPath();
-    chartData.forEach((p, i) => {
-      const x = pad.l + ((w - pad.l - pad.r) * (i + 60 - chartData.length)) / 59;
+    if (data.length < 2) return;
+    g.strokeStyle = color; g.lineWidth = N > 60 ? 1.5 : 2; g.beginPath();
+    data.forEach((p, i) => {
+      const x = pad.l + ((w - pad.l - pad.r) * (i + N - data.length)) / (N - 1);
       const y = pad.t + (h - pad.t - pad.b) * (1 - Math.max(0, Math.min(100, p[key])) / 100);
       i ? g.lineTo(x, y) : g.moveTo(x, y);
     });
@@ -421,7 +438,8 @@ window.addEventListener("resize", () => S.tab === "overview" && drawChart());
 async function loadPackages() {
   try {
     const r = await api("/api/packages");
-    S.packages = r.packages || []; S.blocked = r.blocked || []; S.phrase = r.confirmPhrase || "УДАЛИТЬ";
+    S.packages = r.packages || []; S.blocked = r.blocked || []; S.phrase = r.confirmPhrase || "УДАЛИТЬ"; S.storage = r.storage || {};
+    for (const f of afterPackages) await f();
     S.packages.forEach((p) => (p.level = lvl(p.level)));
     [...S.selected].forEach((id) => { const p = S.packages.find((x) => x.id === id); if (!p || p.state !== "installed") S.selected.delete(id); });
     [...S.selectedRem].forEach((id) => { const p = S.packages.find((x) => x.id === id); if (!p || p.state === "installed") S.selectedRem.delete(id); });
@@ -476,7 +494,8 @@ function renderApps() {
       <td><div class="appname">${esc(p.name)}</div><div class="pkg">${esc(p.id)}</div><div class="reason">${esc(p.reason)}</div>${tagsFor(p)}</td>
       <td><span class="badge ${p.level}">${LEVEL[p.level].t}</span></td>
       <td class="num">${p.running ? fmtKB(p.memKb) : "—"}</td>
-      <td class="num">${fmtB(p.sizeBytes)}</td></tr>`;
+      <td class="num">${fmtB(p.sizeBytes)}</td>
+      ${moreCell(p)}</tr>`;
   }).join("");
   $("appsEmpty").classList.toggle("hidden", list.length > 0);
   $("appsBody").querySelectorAll("input[type=checkbox]").forEach((cb) => (cb.onchange = () => {
@@ -502,7 +521,7 @@ function renderRemoved() {
     <td class="cb"><input type="checkbox" data-id="${esc(p.id)}" ${S.selectedRem.has(p.id) ? "checked" : ""}></td>
     <td><div class="appname">${esc(p.name)}</div><div class="pkg">${esc(p.id)}</div></td>
     <td><span class="badge ${p.level}">${LEVEL[p.level].t}</span></td>
-    <td>${p.state === "removed" ? "удалено" : "отключено"}</td></tr>`).join("");
+    <td>${stateText(p)}</td></tr>`).join("");
   $("remEmpty").classList.toggle("hidden", list.length > 0);
   $("remBody").querySelectorAll("input").forEach((cb) => (cb.onchange = () => {
     cb.checked ? S.selectedRem.add(cb.dataset.id) : S.selectedRem.delete(cb.dataset.id);
@@ -562,6 +581,7 @@ function modal({ title, body, ok, okClass, onOpen, info }) {
     $("mOk").onclick = () => {
       const m = document.querySelector('input[name="method"]:checked');
       S.lastMethod = m ? m.value : "uninstall";
+      S.lastBackup = $("bkChk") ? $("bkChk").checked : true;
       close(true);
     };
     onOpen && onOpen();
@@ -593,10 +613,11 @@ async function confirmRemove() {
   body += groupHtml("unknown", by("unknown"), "— о назначении этих компонентов ничего не известно:");
   body += groupHtml("optional", by("optional"), "");
   body += groupHtml("recommended", by("recommended"), "");
-  if (user.length) body += `<p class="small muted">Приложения, установленные вами (${user.length}), удалятся полностью — вернуть их можно будет только из Play Маркета.</p>`;
+  if (user.length) body += backupNote(user.length);
   body += `<div class="method"><b>Способ</b>
     <label><input type="radio" name="method" value="uninstall" checked><span><b>Удалить для пользователя</b><br><span class="small muted">Освобождает память устройства и оперативную память. Вернуть можно на вкладке «Удалённые».</span></span></label>
-    <label><input type="radio" name="method" value="disable"><span><b>Только отключить</b><br><span class="small muted">Самый осторожный вариант: приложение остаётся на месте, но не запускается. Освобождает оперативную память.</span></span></label></div>`;
+    <label><input type="radio" name="method" value="disable"><span><b>Только отключить</b><br><span class="small muted">Самый осторожный вариант: приложение остаётся на месте, но не запускается. Освобождает оперативную память.</span></span></label>
+    ${methodExtra()}</div>`;
   if (warn.length && !needPhrase) body += `<label class="chk confirmbox"><input type="checkbox" id="ackWarn"> Я понимаю, что эти функции перестанут работать</label>`;
   if (needPhrase) body += `<div class="confirmbox"><label class="chk"><input type="checkbox" id="ackWarn"> Я понимаю риск и знаю, как сделать сброс к заводским настройкам</label>
     <div style="margin-top:10px">Для подтверждения введите слово <b>${esc(S.phrase)}</b>:</div><input id="phrase" autocomplete="off" spellcheck="false"></div>`;
@@ -608,7 +629,8 @@ async function confirmRemove() {
       const btn = $("mOk");
       const check = () => {
         const ack = $("ackWarn") ? $("ackWarn").checked : true;
-        const ph = $("phrase") ? $("phrase").value.trim().toUpperCase() === S.phrase : true;
+        // In the English interface the word is shown (and accepted) as DELETE.
+        const ph = $("phrase") ? [S.phrase, window.LANG === "en" ? "DELETE" : S.phrase].includes($("phrase").value.trim().toUpperCase()) : true;
         btn.disabled = !(ack && ph);
       };
       ["ackWarn", "phrase"].forEach((id) => $(id) && ($(id).oninput = $(id).onchange = check));
@@ -617,7 +639,7 @@ async function confirmRemove() {
   });
   if (!ok) return;
   const method = S.lastMethod || "uninstall";
-  const done = await runChange("/api/remove", { packages: pk.map((p) => p.id), accepted: true, confirm: needPhrase ? S.phrase : "", method }, "Удаление");
+  const done = await runChange("/api/remove", { packages: pk.map((p) => p.id), accepted: true, confirm: needPhrase ? S.phrase : "", method, backup: S.lastBackup !== false }, "Удаление");
   if (done) { S.selected.clear(); renderApps(); }
 }
 
@@ -637,7 +659,7 @@ async function runChange(path, body, title) {
     const okN = res.filter((x) => x.ok).length;
     const html = `<p>Успешно: <b>${okN}</b> из ${res.length}</p>` + res.map((x) => {
       const p = S.packages.find((q) => q.id === x.id) || { name: x.id };
-      const how = x.method !== "disable" ? "" : body.method === "disable" ? " (отключено)" : " (отключено — удалить не разрешено, но работать оно не будет)";
+      const how = x.method === "backup" ? " (установлено из сохранённой копии)" : x.method !== "disable" ? "" : body.method === "disable" ? " (отключено)" : body.method === "trial" ? " (отключено на пробу)" : " (отключено — удалить не разрешено, но работать оно не будет)";
       return `<div class="res"><span class="${x.ok ? "ok" : "bad"}">${x.ok ? "✓" : "✗"}</span><div><b>${esc(p.name)}</b>${how}<div class="pkg">${esc(x.id)}${x.ok ? "" : " — " + esc(x.output)}</div></div></div>`;
     }).join("") + (okN && path.includes("remove") ? '<p class="small muted">Перезагрузите телевизор, чтобы освободить память.</p>' : "");
     done = true;
@@ -651,7 +673,7 @@ async function runChange(path, body, title) {
 }
 
 // ---------------- Журнал ----------------
-const ACTIONS = { remove: "Удаление", restore: "Восстановление", tweak: "Улучшение", install: "Установка" };
+const ACTIONS = { remove: "Удаление", restore: "Восстановление", tweak: "Улучшение", install: "Установка", rollback: "Откат" };
 async function loadHistory() {
   try {
     const r = await api("/api/history");
@@ -780,28 +802,6 @@ async function loadLaunchers() {
   catch (e) { if (S.status === "connected") toast(e.message, true); }
 }
 
-function renderLaunchers() {
-  const L = S.launchers;
-  if (!L) return;
-  const installed = L.installed || [], names = L.names || {};
-  const title = (id) => (S.packages.find((p) => p.id === id) || {}).name || names[id] || id;
-  $("curLauncher").textContent = L.current ? "сейчас: " + title(L.current) : "";
-  $("launcherList").innerHTML = (L.catalog || []).map((l) => {
-    const has = installed.includes(l.package), cur = L.current === l.package;
-    return `<div class="launcher"><h3>${esc(l.name)} ${cur ? '<span class="badge recommended">основной</span>' : has ? '<span class="badge optional">установлен</span>' : ""}</h3>
-      <p>${esc(l.description)}</p>
-      <div class="btns">
-        <button class="primary small-btn" data-install="${esc(l.id)}">${has ? "Обновить" : "Установить"}</button>
-        ${has && !cur ? `<button class="ghost small-btn" data-home="${esc(l.package)}">Сделать основным</button>` : ""}
-        ${l.store && !has ? `<button class="ghost small-btn" data-store="${esc(l.id)}" title="Откроет страницу приложения в Play Маркете на экране телевизора — установку подтвердите пультом">Открыть в Play Маркете на ТВ</button>` : ""}
-        ${l.site ? `<a href="${esc(l.site)}" target="_blank" rel="noopener noreferrer">страница разработчика</a>` : ""}
-      </div></div>`;
-  }).join("") || '<div class="muted">Список приложений будет расширяться. Если вы хотите добавить своё приложение в магазин — свяжитесь с разработчиком.</div>';
-  $("installedLaunchers").innerHTML = installed.length ? `<div class="muted small" style="margin-bottom:4px">Рабочие столы на телевизоре</div>` + installed.map((id) => `<div class="lrow">
-      <div><b>${esc(title(id))}</b> <span class="pkg">${esc(id)}</span></div>
-      ${id === L.current ? '<span class="badge recommended">основной</span>' : `<button class="ghost small-btn" data-home="${esc(id)}">Сделать основным</button>`}</div>`).join("") : "";
-}
-
 async function setHome(pkg) {
   try { await api("/api/launcher/home", { package: pkg }); toast("Готово: рабочий стол изменён. Нажмите «Домой» на пульте, чтобы проверить."); }
   catch (e) { toast(e.message, true); }
@@ -834,26 +834,6 @@ async function withProgress(fn) {
   }
 }
 function renderProgress(s) { const p = $("progText"); if (p && s.progress) p.textContent = s.progress; }
-
-async function installLauncher(id) {
-  const l = ((S.launchers || {}).catalog || []).find((x) => x.id === id);
-  if (!l) return;
-  const src = S.demo ? "В демо-режиме ничего не скачивается: эмулятору передаётся файл-заглушка." : `Программа скачает последнюю версию со страницы разработчика на GitHub (${esc(l.repo)}) и установит её на телевизор. Нужен интернет на компьютере.`;
-  if (!(await modal({ title: `Установить ${l.name}?`, body: `<p>${src}</p><p class="small muted">Заводской рабочий стол останется на месте — вы сможете вернуться к нему в любой момент.</p>`, ok: "Установить", okClass: "primary" }))) return;
-  let r;
-  try { r = await withProgress(() => api("/api/launcher/install", { id })); }
-  catch (e) { return toast(e.message, true); }
-  await loadPackages();
-  await loadLaunchers();
-  if (!r.package) return toast(`${l.name} установлен.`);
-  if ((S.launchers || {}).current === r.package) return toast(`${l.name} обновлён.`);
-  const ok = await modal({
-    title: `${l.name} установлен ✓`,
-    body: "<p>Сделать его основным рабочим столом? Он будет открываться по кнопке «Домой».</p><p class='small muted'>Вернуть прежний можно на этой же вкладке.</p>",
-    ok: "Сделать основным", okClass: "primary",
-  });
-  if (ok) setHome(r.package);
-}
 
 $("btnApk").onclick = () => $("apkFile").click();
 $("apkFile").onchange = async (e) => {

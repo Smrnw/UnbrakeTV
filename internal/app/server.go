@@ -68,7 +68,12 @@ type Server struct {
 	progress     string // what the long operation is doing right now
 	settings     settings
 	update       UpdateInfo
+	knowledge    KnowledgeInfo
 	quit         chan struct{}
+
+	fileMu      sync.Mutex    // guards the JSON files in the data folder
+	demoDir     string        // throw-away data folder of the demo TV
+	trialPeriod time.Duration // how long a trial switch-off lasts
 }
 
 func New(dataDir, version string) (*Server, error) {
@@ -85,6 +90,9 @@ func New(dataDir, version string) (*Server, error) {
 		quit: make(chan struct{}), http: &http.Client{Timeout: 10 * time.Minute},
 	}
 	s.settings = s.loadSettings()
+	for _, f := range onStart {
+		f(s)
+	}
 	return s, nil
 }
 
@@ -100,7 +108,7 @@ func (s *Server) Handler(static http.Handler) http.Handler {
 				httpErr(w, http.StatusForbidden, "неверный токен")
 				return
 			}
-			if method != "" && r.Method != method {
+			if method != "" && r.Method != method || method == "" && r.Method != "GET" && r.Method != "POST" {
 				httpErr(w, http.StatusMethodNotAllowed, "неверный метод запроса")
 				return
 			}
@@ -127,6 +135,10 @@ func (s *Server) Handler(static http.Handler) http.Handler {
 	api("/api/launcher/home", "POST", s.handleLauncherHome)
 	api("/api/launcher/store", "POST", s.handleLauncherStore)
 	api("/api/install", "POST", s.handleInstall)
+	api("/api/catalog", "POST", s.handleCatalog)
+	for _, f := range featureRoutes {
+		f(s, api)
+	}
 	api("/api/update", "POST", s.handleUpdate)
 	api("/api/settings", "POST", s.handleSettings)
 	api("/api/quit", "POST", func(w http.ResponseWriter, r *http.Request) {
@@ -185,12 +197,16 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	if s.dev != nil && !s.dev.Conn.Alive() {
 		s.dev, s.status, s.statusErr = nil, "error", lostMsg
 	}
-	writeJSON(w, map[string]any{
+	m := map[string]any{
 		"status": s.status, "error": s.statusErr, "needsPairing": s.needsPairing, "device": s.info,
 		"version": s.Version, "lastAddress": s.lastAddress(), "recent": s.recent(),
 		"demo": s.demo && s.status != "idle", "progress": s.progress, "busy": s.busy,
 		"update": s.update, "updateCheck": s.settings.UpdateCheck,
-	})
+	}
+	for _, f := range stateExtra {
+		f(s, m)
+	}
+	writeJSON(w, m)
 }
 
 func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
@@ -460,6 +476,9 @@ func (s *Server) StartDemo() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if s.demoDir, err = os.MkdirTemp("", "unbrake-demo-"); err != nil {
+		return "", err
+	}
 	addr, err := t.Listen("127.0.0.1:0")
 	if err != nil {
 		return "", fmt.Errorf("не удалось запустить демо-телевизор: %w", err)
@@ -543,7 +562,11 @@ func (s *Server) handlePackages(w http.ResponseWriter, r *http.Request) {
 			p[i].Reason = "Удаление запрещено. " + why
 		}
 	}
-	writeJSON(w, map[string]any{"packages": p, "blocked": keys(hardBlocked), "confirmPhrase": ConfirmPhrase})
+	m := map[string]any{"packages": p, "blocked": keys(hardBlocked), "confirmPhrase": ConfirmPhrase}
+	for _, f := range packagesExtra {
+		f(s, d, m)
+	}
+	writeJSON(w, m)
 }
 
 func keys(m map[string]string) []string {
@@ -587,7 +610,8 @@ type changeReq struct {
 	Packages []string `json:"packages"`
 	Confirm  string   `json:"confirm"`  // must equal ConfirmPhrase for critical packages
 	Accepted bool     `json:"accepted"` // user acknowledged warnings for caution/unknown
-	Method   string   `json:"method"`   // "uninstall" (default) or "disable"
+	Method   string   `json:"method"`   // "uninstall" (default), "disable" or "trial"
+	Backup   bool     `json:"backup"`   // save a copy of user-installed apps before removing them
 }
 
 func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
@@ -654,12 +678,7 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 409, "Нужно подтвердить удаление компонентов с предупреждением: "+strings.Join(warn, ", "))
 		return
 	}
-	var res []tv.Result
-	if req.Method == "disable" {
-		res = d.Disable(req.Packages)
-	} else {
-		res = d.Remove(req.Packages)
-	}
+	res := removePackages(s, d, all, req)
 	s.logHistory("remove", res)
 	writeJSON(w, map[string]any{"results": res})
 }
@@ -675,7 +694,7 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 409, err.Error())
 		return
 	}
-	res := d.Restore(req.Packages)
+	res := restorePackages(s, d, req.Packages)
 	s.logHistory("restore", res)
 	writeJSON(w, map[string]any{"results": res})
 }
@@ -791,7 +810,30 @@ func (s *Server) handleTweak(w http.ResponseWriter, r *http.Request) {
 // handleApp stops one running app (it starts again when the user opens it).
 func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 	var req struct{ Action, Package string }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Action != "stop" || !tv.ValidPackage(req.Package) {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !tv.ValidPackage(req.Package) {
+		httpErr(w, 400, "неверный запрос")
+		return
+	}
+	if act, ok := appActions[req.Action]; ok {
+		if _, blocked := hardBlocked[req.Package]; blocked || tv.Lookup(req.Package, false).Level == tv.Critical {
+			httpErr(w, 403, "Этот компонент нужен системе — менять его нельзя.")
+			return
+		}
+		d, err := s.device()
+		if err != nil {
+			httpErr(w, 409, err.Error())
+			return
+		}
+		msg, err := act(s, d, req.Package)
+		if err != nil {
+			httpErr(w, 500, err.Error())
+			return
+		}
+		s.logHistory("tweak", []tv.Result{{ID: req.Package, OK: true, Method: "tweak", Output: msg}})
+		writeJSON(w, map[string]bool{"ok": true})
+		return
+	}
+	if req.Action != "stop" {
 		httpErr(w, 400, "неверный запрос")
 		return
 	}

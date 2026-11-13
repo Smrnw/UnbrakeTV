@@ -5,6 +5,7 @@
 package faketv
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -15,6 +16,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"log"
 	"math/big"
@@ -84,6 +88,15 @@ type TV struct {
 	killedAt  time.Time
 	cpuTicks  [4]uint64
 	listeners []net.Listener
+
+	restricted  map[string]bool // background work forbidden through appops
+	devConfig   map[string]string
+	sessions    map[string]string // install sessions
+	sessionData map[string][]byte // install session → first uploaded file
+	booted      time.Time
+	cursor      int    // highlighted tile of the home screen
+	screen      string // "home" or the package shown on screen
+	typed       string
 }
 
 var procs = []proc{
@@ -101,6 +114,8 @@ func New(opt Options) (*TV, error) {
 		opt: opt, removed: map[string]bool{}, disabled: map[string]bool{}, stopped: map[string]bool{},
 		third: map[string]bool{}, stubborn: map[string]bool{"com.mediatek.tv.service": true},
 		settings: map[string]string{}, files: map[string][]byte{},
+		restricted: map[string]bool{}, devConfig: map[string]string{}, sessions: map[string]string{}, sessionData: map[string][]byte{},
+		booted: time.Now().Add(-12 * 24 * time.Hour), screen: "home",
 		launchers: []string{"com.mitv.tvhome.atv", "com.google.android.tvlauncher"},
 		home:      "com.mitv.tvhome.atv",
 	}
@@ -374,6 +389,9 @@ func (t *TV) serve(raw net.Conn) {
 			continue
 		}
 		cmdline, ok := strings.CutPrefix(svc, "shell:")
+		if raw, isExec := strings.CutPrefix(svc, "exec:"); isExec {
+			cmdline, ok = raw, true
+		}
 		if !ok {
 			send(c, cCLSE, 0, local, nil)
 			continue
@@ -461,9 +479,17 @@ func (t *TV) serveSync(c io.ReadWriter, remote, local uint32) bool {
 		buf = append(buf, data...)
 		for len(buf) >= 8 {
 			id, n := string(buf[:4]), int(binary.LittleEndian.Uint32(buf[4:]))
-			if id == "SEND" || id == "DATA" {
+			if id == "SEND" || id == "DATA" || id == "RECV" {
 				if len(buf) < 8+n {
 					break
+				}
+				if id == "RECV" {
+					name := string(buf[8 : 8+n])
+					buf = buf[8+n:]
+					if !t.sendFile(c, remote, local, name) {
+						return false
+					}
+					continue
 				}
 				if id == "SEND" {
 					path, _, _ = strings.Cut(string(buf[8:8+n]), ",")
@@ -499,6 +525,133 @@ func (t *TV) serveSync(c io.ReadWriter, remote, local uint32) bool {
 			}
 		}
 	}
+}
+
+// sendFile is the sending half of "adb pull".
+func (t *TV) sendFile(c io.ReadWriter, remote, local uint32, name string) bool {
+	pkt := func(id string, n int, data []byte) bool {
+		b := make([]byte, 8, 8+len(data))
+		copy(b, id)
+		binary.LittleEndian.PutUint32(b[4:], uint32(n))
+		send(c, cWRTE, remote, local, append(b, data...))
+		cmd, _, _, _, err := recv(c)
+		return err == nil && cmd == cOKAY
+	}
+	t.mu.Lock()
+	var body []byte
+	if pkg, ok := strings.CutPrefix(name, "/data/app/"); ok {
+		pkg = strings.TrimSuffix(pkg, "/base.apk")
+		for _, p := range t.all {
+			if p == pkg && !t.removed[p] {
+				flag := ""
+				for _, l := range t.launchers {
+					if l == pkg {
+						flag = ";launcher"
+					}
+				}
+				body = append([]byte(FakeAPKPrefix+pkg+flag+"\n"), make([]byte, 150_000)...)
+			}
+		}
+	} else if b, ok := t.files[name]; ok {
+		body = b
+	}
+	t.mu.Unlock()
+	if body == nil {
+		msg := "open failed: No such file or directory"
+		return pkt("FAIL", len(msg), []byte(msg))
+	}
+	for len(body) > 0 {
+		n := min(len(body), 64*1024)
+		if !pkt("DATA", n, body[:n]) {
+			return false
+		}
+		body = body[n:]
+	}
+	return pkt("DONE", 0, nil)
+}
+
+// screenshot draws the "TV screen": a row of tiles with the highlighted one.
+func (t *TV) screenshot() string {
+	const w, h = 480, 270
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	fill := func(x0, y0, x1, y1 int, c color.RGBA) {
+		for y := max(y0, 0); y < min(y1, h); y++ {
+			for x := max(x0, 0); x < min(x1, w); x++ {
+				img.SetRGBA(x, y, c)
+			}
+		}
+	}
+	bg := color.RGBA{18, 24, 38, 255}
+	if t.screen != "home" {
+		bg = color.RGBA{60, 20, 20, 255}
+	}
+	fill(0, 0, w, h, bg)
+	fill(20, 20, 200, 34, color.RGBA{90, 100, 120, 255})
+	for i := 0; i < 10; i++ {
+		x, y := 20+(i%5)*90, 80+(i/5)*80
+		c := color.RGBA{50, 70, 110, 255}
+		if t.screen == "home" && i == t.cursor {
+			fill(x-4, y-4, x+84, y+64, color.RGBA{255, 255, 255, 255})
+			c = color.RGBA{56, 189, 248, 255}
+		}
+		fill(x, y, x+80, y+60, c)
+	}
+	// Typed characters show up as a growing bar.
+	fill(20, 240, 20+min(len(t.typed), 44)*10, 250, color.RGBA{34, 197, 94, 255})
+	var buf bytes.Buffer
+	png.Encode(&buf, img)
+	return buf.String()
+}
+
+func (t *TV) key(code int) {
+	switch code {
+	case 21:
+		t.cursor = (t.cursor + 9) % 10
+	case 22:
+		t.cursor = (t.cursor + 1) % 10
+	case 19, 20:
+		t.cursor = (t.cursor + 5) % 10
+	case 23:
+		t.screen = "app"
+	case 3, 4:
+		t.screen = "home"
+	case 67:
+		if len(t.typed) > 0 {
+			t.typed = t.typed[:len(t.typed)-1]
+		}
+	}
+}
+
+// settingsCmd handles "settings get|put|delete <namespace> <key> [value]" chains.
+func (t *TV) settingsCmd(cmd string) string {
+	out := ""
+	for _, part := range strings.Split(cmd, ";") {
+		f := strings.Fields(part)
+		if len(f) < 4 || f[0] != "settings" {
+			continue
+		}
+		k := f[2] + "/" + f[3]
+		switch f[1] {
+		case "get":
+			if v, ok := t.settings[k]; ok {
+				out += v + "\n"
+			} else {
+				out += "null\n"
+			}
+		case "put":
+			if len(f) >= 5 {
+				t.settings[k] = f[4]
+			}
+		case "delete":
+			delete(t.settings, k)
+		}
+	}
+	return out
+}
+
+var autostart = []string{
+	"com.mitv.tvhome.atv", "com.miui.tv.analytics", "com.xiaomi.statistic", "com.mitv.tvhome.mitvplus",
+	"com.google.android.gms", "ru.mts.mtstv", "com.netflix.ninja", "com.xm.webcontent",
 }
 
 func (t *TV) gone(p string) bool { return t.removed[p] || t.disabled[p] }
@@ -635,7 +788,7 @@ func (t *TV) shell(cmd string) string {
 	case strings.HasPrefix(cmd, "sleep "):
 		return ""
 	case strings.HasPrefix(cmd, "getprop"):
-		return "Xiaomi\nMi TV A2 43\n11\n30\narmeabi-v7a\n2\n"
+		return "Xiaomi\nMi TV A2 43\n11\n30\narmeabi-v7a\nFAKE0001\n2\n"
 	case plain == "pm list packages -u":
 		return t.list(func(string) bool { return true })
 	case plain == "pm list packages":
@@ -652,7 +805,7 @@ func (t *TV) shell(cmd string) string {
 			}
 		}
 		return s
-	case strings.Contains(cmd, "resolve-activity"):
+	case strings.Contains(cmd, "resolve-activity") && !strings.Contains(cmd, "LEANBACK_LAUNCHER"):
 		h := t.homeNow()
 		if h == "" {
 			h = "com.android.tv.settings"
@@ -675,47 +828,199 @@ func (t *TV) shell(cmd string) string {
 	case strings.HasPrefix(cmd, "ime list"):
 		return "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME\n"
 	case strings.HasPrefix(cmd, "dumpsys diskstats"):
-		var names, sizes []string
+		var names, sizes, caches []string
+		var appTotal, cacheTotal int
 		for i, p := range t.all {
 			if t.removed[p] {
 				continue
 			}
+			cache := t.sizeKB(i) * 150
+			if t.settings["cleared/"+p] != "" || t.freedKB > 0 {
+				cache = 0
+			}
 			names = append(names, `"`+p+`"`)
 			sizes = append(sizes, fmt.Sprint(t.sizeKB(i)*1000))
+			caches = append(caches, fmt.Sprint(cache))
+			appTotal += t.sizeKB(i) * 1000
+			cacheTotal += cache
 		}
-		return "Latency: 1ms [512B Data Write]\nPackage Names: [" + strings.Join(names, ",") + "]\nApp Sizes: [" + strings.Join(sizes, ",") + "]\n"
+		return fmt.Sprintf("Latency: 1ms [512B Data Write]\nApp Size: %d\nApp Data Size: 310000000\nApp Cache Size: %d\nPhotos Size: 12000000\nVideos Size: 480000000\nAudio Size: 0\nDownloads Size: 95000000\nSystem Size: 1900000000\nOther Size: 140000000\n", appTotal, cacheTotal) +
+			"Package Names: [" + strings.Join(names, ",") + "]\nApp Sizes: [" + strings.Join(sizes, ",") + "]\nCache Sizes: [" + strings.Join(caches, ",") + "]\n"
 	case strings.HasPrefix(cmd, "head -1 /proc/stat"):
 		t.cpuTicks[0] += uint64(4 * len(t.running()))
 		t.cpuTicks[2] += uint64(10 + mr.IntN(20))
 		t.cpuTicks[3] += uint64(100 + mr.IntN(50))
 		k := t.cpuTicks
-		return fmt.Sprintf("cpu  %d 0 %d %d 0 0 0 0 0 0\n@@@\nMemTotal:        1530000 kB\nMemFree:          80000 kB\nMemAvailable:    %d kB\n@@@\n%s@@@\n58000\n46500\n@@@\n%s",
-			k[0], k[2], k[3], t.memAvailKB(), t.df(), t.topOut())
+		return fmt.Sprintf("cpu  %d 0 %d %d 0 0 0 0 0 0\n@@@\nMemTotal:        1530000 kB\nMemFree:          80000 kB\nMemAvailable:    %d kB\n@@@\n%s@@@\n58000\n46500\n@@@\n%s@@@\n%.2f 100.00\n",
+			k[0], k[2], k[3], t.memAvailKB(), t.df(), t.topOut(), time.Since(t.booted).Seconds())
 	case strings.HasPrefix(cmd, "top"):
 		return t.topOut()
 	case strings.HasPrefix(cmd, "ps "):
 		return ""
 	case strings.Contains(cmd, "MemAvailable"):
 		return fmt.Sprintf("MemAvailable:    %d kB\n", t.memAvailKB())
-	case strings.HasPrefix(cmd, "settings get global"):
-		if v, ok := t.settings[last]; ok {
-			return v + "\n"
+	case strings.HasPrefix(cmd, "settings "):
+		return t.settingsCmd(cmd)
+	case strings.HasPrefix(cmd, "device_config "):
+		if len(f) < 4 {
+			return ""
 		}
-		return "null\n"
-	case strings.HasPrefix(cmd, "settings put global"):
-		for _, part := range strings.Split(cmd, ";") {
-			ff := strings.Fields(part)
-			if len(ff) == 5 {
-				t.settings[ff[3]] = ff[4]
+		k := f[2] + "/" + f[3]
+		switch f[1] {
+		case "get":
+			if v, ok := t.devConfig[k]; ok {
+				return v + "\n"
+			}
+			return "null\n"
+		case "put":
+			if len(f) >= 5 {
+				t.devConfig[k] = f[4]
+			}
+		case "delete":
+			delete(t.devConfig, k)
+		}
+		return ""
+	case strings.HasPrefix(cmd, "ping "):
+		if t.settings["global/private_dns_mode"] == "hostname" && strings.Contains(t.settings["global/private_dns_specifier"], "blocked") {
+			return "ping: unknown host ya.ru\nping: unknown host google.com\n"
+		}
+		return "PING ya.ru (77.88.55.242) 56(84) bytes of data.\n1 packets transmitted, 1 received, 0% packet loss, time 0ms\n"
+	case strings.HasPrefix(cmd, "screencap"):
+		return t.screenshot()
+	case strings.HasPrefix(cmd, "input keyevent"):
+		n, _ := strconv.Atoi(last)
+		t.key(n)
+		return ""
+	case strings.HasPrefix(cmd, "input text"):
+		_, txt, _ := strings.Cut(cmd, "input text ")
+		t.typed += strings.ReplaceAll(strings.Trim(txt, "'"), "%s", " ")
+		return ""
+	case strings.HasPrefix(cmd, "am start -W"):
+		ms := 650 + 95*len(t.running()) + mr.IntN(60)
+		if strings.Contains(cmd, " -n ") {
+			ms = 1400 + 130*len(t.running()) + mr.IntN(120)
+			t.screen = "app"
+			for _, x := range f {
+				if i := strings.Index(x, "/"); i > 0 {
+					delete(t.stopped, x[:i])
+				}
+			}
+		} else {
+			t.screen = "home"
+			delete(t.stopped, t.homeNow())
+		}
+		return fmt.Sprintf("Starting: Intent { }\nStatus: ok\nLaunchState: COLD\nTotalTime: %d\nWaitTime: %d\nComplete\n", ms, ms+12)
+	case strings.Contains(cmd, "LEANBACK_LAUNCHER"):
+		for _, x := range f {
+			for _, p := range t.all {
+				if p == x && !t.gone(p) {
+					return "priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=true\n" + p + "/.MainActivity\n"
+				}
+			}
+		}
+		return "No activity found\n"
+	case strings.Contains(cmd, "query-receivers"):
+		s := ""
+		for _, p := range autostart {
+			if !t.gone(p) {
+				s += p + "/.BootReceiver\n"
+			}
+		}
+		return s
+	case strings.HasPrefix(cmd, "dumpsys activity services"):
+		s := ""
+		for i, p := range t.running() {
+			base := strings.SplitN(p.name, ":", 2)[0]
+			if !strings.Contains(base, ".") || t.restricted[base] {
+				continue
+			}
+			for j := 0; j <= i%3; j++ {
+				s += fmt.Sprintf("  * ServiceRecord{%x u0 %s/.Service%d}\n", 0xa1b2c0+i*16+j, base, j)
+			}
+		}
+		return s
+	case strings.HasPrefix(cmd, "dumpsys power"):
+		for i, p := range t.all {
+			if p == "com.miui.tv.analytics" && !t.gone(p) && !t.stopped[p] && !t.restricted[p] {
+				return fmt.Sprintf("  PARTIAL_WAKE_LOCK              'analytics-upload' ACQ=-3m12s (uid=%d pid=2211)\n", 10000+i)
 			}
 		}
 		return ""
+	case plain == "pm list packages -U":
+		var sb strings.Builder
+		for i, p := range t.all {
+			if !t.removed[p] {
+				fmt.Fprintf(&sb, "package:%s uid:%d\n", p, 10000+i)
+			}
+		}
+		return sb.String()
+	case strings.Contains(cmd, "appops query-op"):
+		s := ""
+		for _, p := range t.all {
+			if t.restricted[p] {
+				s += p + "\n"
+			}
+		}
+		return s
+	case strings.Contains(cmd, "appops set"):
+		for i, x := range f {
+			if x == "RUN_ANY_IN_BACKGROUND" && i > 0 && i+1 < len(f) {
+				if f[i+1] == "ignore" {
+					t.restricted[f[i-1]] = true
+				} else {
+					delete(t.restricted, f[i-1])
+				}
+			}
+		}
+		return ""
+	case strings.HasPrefix(cmd, "pm path"):
+		for _, x := range f {
+			for _, p := range t.all {
+				if p == x && !t.removed[p] {
+					return "package:/data/app/" + p + "/base.apk\n"
+				}
+			}
+		}
+		return ""
+	case strings.HasPrefix(cmd, "pm clear"):
+		for _, x := range f {
+			for _, p := range t.all {
+				if p == x {
+					t.settings["cleared/"+p] = "1"
+					return "Success\n"
+				}
+			}
+		}
+		return "Failed\n"
+	case strings.HasPrefix(cmd, "pm install-create"):
+		id := strconv.Itoa(70 + len(t.sessions))
+		t.sessions[id] = ""
+		return "Success: created install session [" + id + "]\n"
+	case strings.HasPrefix(cmd, "pm install-write"):
+		if len(f) >= 5 {
+			if _, ok := t.sessionData[f[2]]; !ok {
+				t.sessionData[f[2]] = t.files[f[4]]
+			}
+		}
+		return "Success: streamed bytes\n"
+	case strings.HasPrefix(cmd, "pm install-commit"):
+		if len(f) >= 3 {
+			// The files were removed after writing; the emulator kept the first one.
+			if b, ok := t.sessionData[f[2]]; ok {
+				t.files["/session"] = b
+				return t.install("/session")
+			}
+		}
+		return "Failure [INSTALL_FAILED_INVALID_APK]\n"
+	case strings.HasPrefix(cmd, "pm install-abandon"):
+		return "Success\n"
 	case strings.HasPrefix(cmd, "pm trim-caches"):
 		t.freedKB = min(t.freedKB+350000, 700000)
 		return ""
 	case strings.HasPrefix(cmd, "df"):
 		return t.df()
 	case cmd == "reboot":
+		t.booted, t.screen, t.cursor = time.Now(), "home", 0
 		t.stopped = map[string]bool{}
 		t.killedAt = time.Time{}
 		return ""

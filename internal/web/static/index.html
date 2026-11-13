@@ -13,7 +13,7 @@
     <svg viewBox="0 0 32 32" width="28" height="28"><rect x="3" y="6" width="26" height="17" rx="3" fill="none" stroke="currentColor" stroke-width="2.2"/><path d="M11 27h10" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><path d="M17.5 8.5l-5 6h4l-2 5 5-6.5h-4z" fill="currentColor"/></svg>
     <span>Unbrake<b>TV</b></span>
   </div>
-  <div id="devchip" class="devchip hidden"></div>
+  <div class="chipwrap"><button id="devchip" class="devchip hidden" title="Переключить телевизор"></button><div id="tvMenu" class="menu hidden"></div></div>
   <div class="spacer"></div>
   <button id="btnDisconnect" class="ghost hidden">Отключиться</button>
   <button id="btnQuit" class="ghost">Выход</button>
@@ -82,7 +82,8 @@
     <div class="metrics">
       <div class="metric"><div class="mlabel">Процессор</div><div class="mval" id="mCpu">—</div><div class="bar"><i id="bCpu"></i></div></div>
       <div class="metric"><div class="mlabel">Оперативная память</div><div class="mval" id="mMem">—</div><div class="bar"><i id="bMem"></i></div><div class="msub" id="sMem"></div></div>
-      <div class="metric"><div class="mlabel">Память устройства</div><div class="mval" id="mStor">—</div><div class="bar"><i id="bStor"></i></div><div class="msub" id="sStor"></div></div>
+      <div class="metric"><div class="mlabel">Память устройства</div><div class="mval" id="mStor">—</div><div class="bar"><i id="bStor"></i></div><div class="msub" id="sStor"></div>
+      </div>
       <div class="metric"><div class="mlabel">Температура</div><div class="mval" id="mTemp">—</div><div class="msub" id="sTemp"></div></div>
     </div>
     <div id="sessionCard" class="card session hidden"></div>
@@ -180,7 +181,17 @@
       <p class="muted">Заводская оболочка с рекламой и рекомендациями — главный источник тормозов. Поставьте лёгкий рабочий стол, сделайте его основным, а заводской потом удалите или отключите на вкладке «Приложения».</p>
       <div id="launcherList" class="launchers"></div>
       <div id="installedLaunchers"></div>
-      <p class="muted small">Установочный файл скачивается с официальной страницы разработчика на GitHub в тот момент, когда вы нажимаете «Установить», и сразу передаётся на телевизор.</p>
+    </div>
+    <div class="card">
+      <div class="cardhead"><h2>Полезные приложения</h2></div>
+      <div id="appList" class="launchers"></div>
+    </div>
+    <div class="card">
+      <div class="cardhead"><h2>Откуда берётся список</h2>
+        <div><button class="ghost small-btn" id="btnAddApp">Добавить свой источник…</button> <button class="ghost small-btn" id="btnRefreshCat">Обновить список</button></div></div>
+      <div id="storeInfo" class="muted"></div>
+      <div class="btnrow"><button class="linkbtn" id="btnStore">Сменить репозиторий приложений…</button><button class="linkbtn hidden" id="btnResetCat"></button></div>
+      <p class="muted small">Установочный файл скачивается с GitHub в тот момент, когда вы нажимаете «Установить», и сразу передаётся на телевизор.</p>
     </div>
     <div class="card">
       <h2>Установить приложение из APK-файла</h2>
@@ -218,5 +229,6 @@
 <div id="toast" class="toast hidden"></div>
 
 <script src="app.js"></script>
+<script src="store.js"></script>
 </body>
 </html>

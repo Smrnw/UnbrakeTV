@@ -20,20 +20,20 @@ jobs:
         run: |
           VERSION=dev
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then VERSION="${GITHUB_REF_NAME#v}"; fi
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o distr/UnbrakeTV.exe .
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "distr/UnbrakeTV-$VERSION.exe" .
       - uses: actions/upload-artifact@v4
         with:
           name: UnbrakeTV
-          path: distr/UnbrakeTV.exe
+          path: distr/
       - if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           name: Unbrake TV ${{ github.ref_name }}
-          files: distr/UnbrakeTV.exe
+          files: distr/UnbrakeTV-*.exe
           body: |
             ## Как запустить
 
-            1. Скачайте **UnbrakeTV.exe** ниже, в разделе Assets.
+            1. Скачайте файл **UnbrakeTV-<версия>.exe** ниже, в разделе Assets. Номер версии указан прямо в имени файла.
             2. Запустите его — установка не нужна. Интерфейс откроется в браузере.
             3. Если Windows покажет «Система Windows защитила ваш компьютер» — нажмите **«Подробнее» → «Выполнить в любом случае»**. Программа не подписана платным сертификатом, exe собран автоматически из кода этого репозитория.
 

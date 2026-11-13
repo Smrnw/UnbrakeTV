@@ -150,7 +150,16 @@ func (s *Server) CheckUpdate(ctx context.Context) UpdateInfo {
 	s.mu.Lock()
 	s.update = u
 	s.mu.Unlock()
+	for _, f := range afterUpdateCheck {
+		f(s, ctx)
+	}
 	return u
+}
+
+// KnowledgeInfo describes the downloaded part of the knowledge base.
+type KnowledgeInfo struct {
+	Version int `json:"version"`
+	Rules   int `json:"rules"`
 }
 
 // AutoCheckUpdate runs the start-up check if the user has not turned it off.
