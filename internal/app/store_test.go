@@ -6,11 +6,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Smrnw/UnbrakeTV/internal/faketv"
 )
+
+// testSHA is the commit the fake GitHub serves the app-store repository at.
+const testSHA = "0123456789abcdef0123456789abcdef01234567"
 
 func TestMain(m *testing.M) {
 	// Tests never talk to the real GitHub.
@@ -40,8 +45,9 @@ type launchersResp struct {
 	Have    map[string]bool
 	Hidden  int
 	Store   struct {
-		Repo, Error     string
-		Active, Default bool
+		Repo, Error            string
+		Active, Default, Stale bool
+		Updated                int64
 	}
 }
 
@@ -139,28 +145,30 @@ func TestAppStoreRepository(t *testing.T) {
 			picked <- r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
 		}
 		switch r.URL.Path {
-		case "/" + store + "/HEAD/catalog.json":
+		case "/" + store + "/" + testSHA + "/catalog.json":
 			io.WriteString(w, catalogJSON)
-		case "/repos/" + store + "/git/trees/HEAD":
+		case "/repos/" + store + "/commits/HEAD":
+			io.WriteString(w, testSHA)
+		case "/repos/" + store + "/git/trees/" + testSHA:
 			io.WriteString(w, treeJSON)
-		case "/" + store + "/HEAD/apps/Media/description.txt":
+		case "/" + store + "/" + testSHA + "/apps/Media/description.txt":
 			io.WriteString(w, "\xef\xbb\xbfМедиацентр для фильмов,\r\nмузыки и фото.\r\n\r\n- работает с сетевыми папками\r\n")
-		case "/" + store + "/HEAD/Лаунчер TVX/info.json":
+		case "/" + store + "/" + testSHA + "/Лаунчер TVX/info.json":
 			io.WriteString(w, `{"kind":"launcher","package":"com.example.tvxhome","store":true}`)
-		case "/" + store + "/HEAD/Лаунчер TVX/README.md":
+		case "/" + store + "/" + testSHA + "/Лаунчер TVX/README.md":
 			io.WriteString(w, "# TVX Home\n\nПростой **рабочий стол** с виджетами.\n")
-		case "/" + store + "/HEAD/apps/Stream/info.json":
+		case "/" + store + "/" + testSHA + "/apps/Stream/info.json":
 			io.WriteString(w, `{"name":"Stream","description":"Берётся у разработчика.","repo":"example/stream"}`)
-		case "/" + store + "/HEAD/apps/Broken/info.json":
+		case "/" + store + "/" + testSHA + "/apps/Broken/info.json":
 			io.WriteString(w, `{"name": "Сломанный",`)
-		case "/" + store + "/HEAD/apps/Media/media-21-armeabi-v7a.apk", "/" + store + "/HEAD/Лаунчер TVX/tvx.apk":
+		case "/" + store + "/" + testSHA + "/apps/Media/media-21-armeabi-v7a.apk", "/" + store + "/" + testSHA + "/Лаунчер TVX/tvx.apk":
 			w.Write(apk)
 		case "/repos/" + store + "/releases/latest":
 			json.NewEncoder(w).Encode(ghRelease{Tag: "2026.11", Assets: []ghAsset{
 				{Name: "big-game.apk", URL: "https://github.com/" + store + "/releases/download/2026.11/big-game.apk"},
 				{Name: "evil.apk", URL: "https://evil.example/evil.apk"},
 			}})
-		case "/" + store + "/HEAD/apps/My Player (1).apk", "/" + store + "/HEAD/apps/media-21.apk":
+		case "/" + store + "/" + testSHA + "/apps/My Player (1).apk", "/" + store + "/" + testSHA + "/apps/media-21.apk":
 			w.Write(apk)
 		default:
 			http.NotFound(w, r)
@@ -257,5 +265,105 @@ func TestAppStoreRepository(t *testing.T) {
 	c.do("POST", "/api/catalog", map[string]string{"action": "store", "repo": ""}, nil)
 	if c.do("GET", "/api/launchers", nil, &ln); len(ln.Catalog) != 0 || ln.Store.Repo != DefaultStoreRepo {
 		t.Fatalf("default store: %s", ids(ln.Catalog))
+	}
+}
+
+// A hiccup of GitHub must not freeze an old list, and a list read before the
+// program was restarted must be checked again (the case of 14 November 2026:
+// an app was replaced in the repository, the program kept showing the old one).
+func TestStoreListFollowsRepository(t *testing.T) {
+	const store = "me/tv-apps"
+	var mu sync.Mutex
+	mode, sha, app := "ok", strings.Repeat("1", 40), "Old Home"
+	set := func(m, h, a string) { mu.Lock(); mode, sha, app = m, h, a; mu.Unlock() }
+	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		p := r.URL.Path
+		switch {
+		case mode == "down":
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		case p == "/repos/"+store+"/commits/HEAD" && mode == "ok":
+			io.WriteString(w, sha)
+		case p == "/repos/"+store && mode != "gone":
+			io.WriteString(w, `{"full_name":"me/tv-apps"}`)
+		case p == "/repos/"+store+"/git/trees/"+sha:
+			io.WriteString(w, `{"tree":[{"path":"apps/`+app+`/info.json","type":"blob"}]}`)
+		case p == "/"+store+"/"+sha+"/apps/"+app+"/info.json":
+			// Only the exact commit is served: a read through "HEAD" would miss it.
+			io.WriteString(w, `{"kind":"launcher","repo":"example/home"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer gh.Close()
+	oldRaw, oldAPI := githubRaw, githubAPI
+	githubRaw, githubAPI = gh.URL, gh.URL
+	defer func() { githubRaw, githubAPI = oldRaw, oldAPI }()
+
+	f, _ := faketv.New(faketv.Options{})
+	defer f.Close()
+	addr, _ := f.Listen("127.0.0.1:0")
+	start := func(dir string) (*Server, *client) {
+		s, err := New(dir, "1.2.1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := httptest.NewServer(s.Handler(http.NotFoundHandler()))
+		t.Cleanup(h.Close)
+		c := &client{t: t, url: h.URL, token: s.Token}
+		c.do("POST", "/api/connect", map[string]string{"address": addr}, nil)
+		c.waitStatus("connected")
+		return s, c
+	}
+	s, c := start(t.TempDir())
+	var ln launchersResp
+	list := func(c *client, q string) string {
+		t.Helper()
+		ln = launchersResp{}
+		if code := c.do("GET", "/api/launchers"+q, nil, &ln); code != 200 {
+			t.Fatalf("launchers: %d", code)
+		}
+		return ids(ln.Catalog)
+	}
+
+	c.do("POST", "/api/catalog", map[string]string{"action": "store", "repo": store}, nil)
+	if got := list(c, ""); got != "old-home" || ln.Store.Stale || ln.Store.Error != "" || ln.Catalog[0].Kind != "launcher" {
+		t.Fatalf("first listing: %s %+v %+v", got, ln.Store, ln.Catalog)
+	}
+
+	// The app is replaced, and at that moment GitHub says "not found" for the
+	// repository: the old list stays, but is marked as old and is retried.
+	set("blip", strings.Repeat("2", 40), "New Home")
+	if got := list(c, "?refresh=1"); got != "old-home" || !ln.Store.Stale || !strings.Contains(ln.Store.Error, "ещё раз") || ln.Store.Updated == 0 {
+		t.Fatalf("after a hiccup: %s %+v", got, ln.Store)
+	}
+
+	// The program is restarted a moment later: the list is read again at once
+	// instead of being taken from the cache for ten more minutes.
+	set("ok", strings.Repeat("2", 40), "New Home")
+	_, c2 := start(s.DataDir)
+	if got := list(c2, ""); got != "new-home" || ln.Store.Stale || ln.Store.Error != "" {
+		t.Fatalf("after a restart: %s %+v", got, ln.Store)
+	}
+
+	// No connection: the list is kept; a minute later it is retried by itself.
+	set("down", strings.Repeat("2", 40), "New Home")
+	if got := list(c2, "?refresh=1"); got != "new-home" || !ln.Store.Stale {
+		t.Fatalf("GitHub down: %s %+v", got, ln.Store)
+	}
+	var cache storeCache
+	readJSON(filepath.Join(s.DataDir, "store.json"), &cache)
+	cache.Time -= storeRetry + 1
+	writeJSON2(filepath.Join(s.DataDir, "store.json"), cache)
+	set("ok", strings.Repeat("3", 40), "Newest Home")
+	if got := list(c2, ""); got != "newest-home" || ln.Store.Stale {
+		t.Fatalf("retry after a minute: %s %+v", got, ln.Store)
+	}
+
+	// The repository is really gone: the old list is not shown any more.
+	set("gone", strings.Repeat("3", 40), "Newest Home")
+	if got := list(c2, "?refresh=1"); got != "" || ln.Store.Stale || !strings.Contains(ln.Store.Error, "не найден") {
+		t.Fatalf("repository deleted: %q %+v", got, ln.Store)
 	}
 }

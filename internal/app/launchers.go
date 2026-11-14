@@ -117,10 +117,16 @@ func (s *Server) saveLocalCatalog(lc localCatalog) error {
 // storeCache is the last listing of the app-store repository.
 type storeCache struct {
 	Repo  string     `json:"repo"`
-	Time  int64      `json:"time"`
+	Time  int64      `json:"time"`  // last attempt to read the repository
+	OK    int64      `json:"ok"`    // when Items were read successfully
+	Ref   string     `json:"ref"`   // the commit Items were read from
+	Stale bool       `json:"stale"` // the last attempt failed: Items are older, retry soon
 	Items []Launcher `json:"items"`
 	Error string     `json:"error"`
 }
+
+// storeRetry is how soon a failed look into the repository is repeated.
+const storeRetry = 60
 
 func (s *Server) storeCache() storeCache {
 	var c storeCache
@@ -130,13 +136,16 @@ func (s *Server) storeCache() storeCache {
 	return c
 }
 
-func (s *Server) getText(ctx context.Context, link string, limit int64) ([]byte, int, error) {
+func (s *Server) getText(ctx context.Context, link string, limit int64, accept ...string) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", link, nil)
 	if err != nil {
 		return nil, 0, err
 	}
 	req.Header.Set("User-Agent", "UnbrakeTV/"+s.Version)
 	req.Header.Set("Accept", "application/vnd.github+json")
+	if len(accept) > 0 {
+		req.Header.Set("Accept", accept[0])
+	}
 	resp, err := s.http.Do(req)
 	if err != nil {
 		return nil, 0, errors.New("нет связи с GitHub — проверьте интернет на компьютере")
@@ -196,14 +205,21 @@ func titleFromFile(name string) string {
 	return strings.TrimSpace(strings.NewReplacer("_", " ", "-", " ").Replace(name))
 }
 
-// rawURL is the address of a file inside a repository's default branch.
-func rawURL(repo, file string) string {
+// rawURL is the address of a file inside a repository at the given commit
+// ("HEAD" is the default branch, but GitHub may serve it from a cache for
+// several minutes; an exact commit is always served as it is).
+func rawURL(repo, ref, file string) string {
 	parts := strings.Split(file, "/")
 	for i := range parts {
 		parts[i] = url.PathEscape(parts[i])
 	}
-	return githubRaw + "/" + repo + "/HEAD/" + strings.Join(parts, "/")
+	if ref == "" {
+		ref = "HEAD"
+	}
+	return githubRaw + "/" + repo + "/" + ref + "/" + strings.Join(parts, "/")
 }
+
+var shaRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // skipDirs are folders of a repository that never hold apps.
 var skipDirs = map[string]bool{"knowledge": true, "docs": true, "internal": true, "cmd": true}
@@ -287,22 +303,64 @@ func (s *Server) refreshStore(ctx context.Context) storeCache {
 		}
 	}
 
-	// One request lists every file of the repository.
+	// The listing is read from one exact commit: the file list and every
+	// description belong to the same moment, and nothing comes from a cache.
+	// transient: the answer says nothing about the repository itself (no
+	// connection, a limit, a hiccup of GitHub) — keep the last good list.
+	transient := false
+	ref := ""
+	again := " — попробую ещё раз через минуту."
+	b, code, err := s.getText(ctx, githubAPI+"/repos/"+repo+"/commits/HEAD", 4<<10, "application/vnd.github.sha")
+	switch {
+	case err != nil:
+		problem(err.Error())
+		transient = true
+	case code == http.StatusOK && shaRe.MatchString(strings.TrimSpace(string(b))):
+		ref = strings.TrimSpace(string(b))
+	case code == http.StatusForbidden || code == http.StatusTooManyRequests:
+		problem("GitHub временно ограничил запросы с вашего адреса" + again)
+		transient = true
+	case code == http.StatusConflict:
+		problem("Репозиторий " + repo + " пока пуст.")
+	case code == http.StatusNotFound || code == http.StatusUnprocessableEntity:
+		// Right after a change GitHub sometimes answers "not found" for an
+		// existing repository: ask about the repository itself to be sure.
+		if _, rc, rerr := s.getText(ctx, githubAPI+"/repos/"+repo, 1<<20); rerr == nil && rc == http.StatusNotFound {
+			problem("Репозиторий " + repo + " не найден.")
+		} else {
+			problem("GitHub не отдал список приложений" + again)
+			transient = true
+		}
+	default:
+		problem(fmt.Sprintf("GitHub ответил ошибкой %d", code) + again)
+		transient = true
+	}
+
 	var tree struct {
 		Tree      []struct{ Path, Type string }
 		Truncated bool
 	}
-	found := false
-	b, code, err := s.getText(ctx, githubAPI+"/repos/"+repo+"/git/trees/HEAD?recursive=1", 16<<20)
-	if err != nil {
-		c.Error = err.Error()
-	} else if code == 200 && json.Unmarshal(b, &tree) == nil {
-		found = true
-		if tree.Truncated {
+	if ref != "" {
+		b, code, err := s.getText(ctx, githubAPI+"/repos/"+repo+"/git/trees/"+ref+"?recursive=1", 16<<20)
+		if err != nil || code != http.StatusOK || json.Unmarshal(b, &tree) != nil {
+			problem("GitHub не отдал список файлов репозитория" + again)
+			transient = true
+		} else if tree.Truncated {
 			problem("В репозитории слишком много файлов — показаны не все приложения.")
 		}
-	} else if code == http.StatusForbidden || code == http.StatusTooManyRequests {
-		problem("GitHub временно ограничил запросы с вашего адреса — список обновится позже.")
+	}
+	// read fetches a file of the listed commit. A missing file is fine; any
+	// other failure means the listing would be incomplete.
+	read := func(file string, limit int64) ([]byte, bool) {
+		b, code, err := s.getText(ctx, rawURL(repo, ref, file), limit)
+		if err == nil && code == http.StatusOK {
+			return b, true
+		}
+		if err != nil || code != http.StatusNotFound {
+			problem("GitHub не отдал файл " + file + again)
+			transient = true
+		}
+		return nil, false
 	}
 	var flat []string
 	folders := map[string]*appFolder{}
@@ -341,7 +399,7 @@ func (s *Server) refreshStore(ctx context.Context) storeCache {
 	}
 
 	if hasCatalog {
-		if b, code, err := s.getText(ctx, rawURL(repo, "catalog.json"), 2<<20); err == nil && code == 200 {
+		if b, ok := read("catalog.json", 2<<20); ok {
 			var doc struct{ Apps []Launcher }
 			if json.Unmarshal(bytes.TrimPrefix(b, []byte("\xef\xbb\xbf")), &doc) != nil {
 				problem("В файле catalog.json ошибка — проверьте запятые и кавычки.")
@@ -369,7 +427,7 @@ func (s *Server) refreshStore(ctx context.Context) storeCache {
 		folder := path.Base(d)
 		x := Launcher{ID: folder}
 		if fo.info != "" {
-			if b, code, err := s.getText(ctx, rawURL(repo, fo.info), 256<<10); err == nil && code == 200 {
+			if b, ok := read(fo.info, 256<<10); ok {
 				var inf Launcher
 				if json.Unmarshal(bytes.TrimPrefix(b, []byte("\xef\xbb\xbf")), &inf) != nil {
 					problem("В файле " + fo.info + " ошибка — проверьте запятые и кавычки.")
@@ -382,7 +440,7 @@ func (s *Server) refreshStore(ctx context.Context) storeCache {
 			}
 		}
 		if fo.desc != "" && (x.Description == "" || x.Name == "") {
-			if b, code, err := s.getText(ctx, rawURL(repo, fo.desc), 64<<10); err == nil && code == 200 {
+			if b, ok := read(fo.desc, 64<<10); ok {
 				title, text := plainText(b)
 				if x.Name == "" {
 					x.Name = title
@@ -414,9 +472,8 @@ func (s *Server) refreshStore(ctx context.Context) storeCache {
 			add(Launcher{Name: titleFromFile(f), File: f, Description: "Файл " + path.Base(f) + " из репозитория приложений."})
 		}
 	}
-	if err == nil {
+	if ref != "" {
 		if rel, err := s.latestRelease(ctx, repo); err == nil {
-			found = true
 			for _, a := range rel.Assets {
 				low := strings.ToLower(a.Name)
 				if strings.HasSuffix(low, ".apk") && !files[low] && strings.HasPrefix(a.URL, "https://github.com/"+repo+"/releases/download/") {
@@ -424,15 +481,14 @@ func (s *Server) refreshStore(ctx context.Context) storeCache {
 				}
 			}
 		}
-		if !found {
-			problem("Репозиторий " + repo + " не найден или пока пуст.")
-		}
 	}
-	if c.Error != "" && len(c.Items) == 0 {
-		// Keep showing the last good listing of the same repository.
-		if old := s.storeCache(); old.Repo == repo && len(old.Items) > 0 {
-			c.Items = old.Items
-		}
+	c.Ref, c.Stale = ref, transient
+	if !transient {
+		c.OK = c.Time
+	} else if old := s.storeCache(); old.Repo == repo && old.OK > 0 {
+		// Never replace a good list with a broken one. The old list is shown
+		// as old (with the time it was read) and is checked again soon.
+		c.Items, c.Ref, c.OK = old.Items, old.Ref, old.OK
 	}
 	s.fileMu.Lock()
 	writeJSON2(filepath.Join(s.DataDir, "store.json"), c)
@@ -555,7 +611,11 @@ func (s *Server) downloadAPK(ctx context.Context, l Launcher, abi string) ([]byt
 	}
 	switch {
 	case l.File != "":
-		link = rawURL(store, l.File)
+		ref := ""
+		if c := s.storeCache(); c.Repo == store {
+			ref = c.Ref
+		}
+		link = rawURL(store, ref, l.File)
 	case l.Asset != "":
 		// Only files of the app-store repository's own releases.
 		if !strings.HasPrefix(l.Asset, "https://github.com/"+store+"/releases/download/") {
@@ -634,9 +694,17 @@ func (s *Server) handleLaunchers(w http.ResponseWriter, r *http.Request) {
 	}
 	lc := s.localCatalog()
 	cache := s.storeCache()
-	// Look into the app-store repository now and then (never in the demo).
-	if !s.isDemo() && (cache.Repo != lc.StoreRepo || time.Now().Unix()-cache.Time > 600 || r.URL.Query().Get("refresh") != "") {
+	// Look into the app-store repository once per start of the program, then
+	// every ten minutes, and a minute after a failed attempt (never in the demo).
+	age := time.Now().Unix() - cache.Time
+	s.mu.Lock()
+	seen := s.storeSeen == lc.StoreRepo
+	s.mu.Unlock()
+	if !s.isDemo() && (!seen || cache.Repo != lc.StoreRepo || age > 600 || cache.Stale && age > storeRetry || r.URL.Query().Get("refresh") != "") {
 		cache = s.refreshStore(r.Context())
+		s.mu.Lock()
+		s.storeSeen = lc.StoreRepo
+		s.mu.Unlock()
 	}
 	installed, current := d.Launchers()
 	if installed == nil {
@@ -655,7 +723,7 @@ func (s *Server) handleLaunchers(w http.ResponseWriter, r *http.Request) {
 	}
 	storeInfo := map[string]any{"repo": lc.StoreRepo, "default": lc.StoreRepo == DefaultStoreRepo, "active": cache.Repo == lc.StoreRepo && len(cache.Items) > 0}
 	if cache.Repo == lc.StoreRepo {
-		storeInfo["error"] = cache.Error
+		storeInfo["error"], storeInfo["stale"], storeInfo["updated"] = cache.Error, cache.Stale && cache.OK > 0, cache.OK
 	}
 	writeJSON(w, map[string]any{
 		"catalog": cat, "installed": installed, "current": current, "names": names, "have": have,

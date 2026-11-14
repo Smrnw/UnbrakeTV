@@ -40,9 +40,12 @@ function renderLaunchers() {
       ${id === L.current ? '<span class="badge recommended">основной</span>' : `<button class="ghost small-btn" data-home="${esc(id)}">Сделать основным</button>`}</div>`).join("") : "";
   const st = L.store || {};
   const link = `<a href="https://github.com/${esc(st.repo)}" target="_blank" rel="noopener noreferrer">${esc(st.repo)}</a>`;
+  const when = st.updated ? new Date(st.updated * 1000).toLocaleString("ru-RU", { day: "numeric", month: "long", hour: "2-digit", minute: "2-digit" }) : "";
+  const note = st.stale && when ? ` <span class="warn">Не удалось обновить список: ${esc(st.error)} Показан список от ${esc(when)}.</span>`
+    : st.error ? ` <span class="warn">${esc(st.error)}</span>` : "";
   $("storeInfo").innerHTML = S.demo ? "В демо-режиме показаны примеры, из интернета ничего не скачивается."
-    : st.active ? `Список приложений берётся из репозитория ${link} на GitHub.${st.error ? ` <span class="warn">${esc(st.error)}</span>` : ""}`
-      : `Репозиторий приложений ${link} пока недоступен.${st.error ? ` <span class="small">${esc(st.error)}</span>` : ""}`;
+    : st.active ? `Список приложений берётся из репозитория ${link} на GitHub.${note}`
+      : `Репозиторий приложений ${link} пока недоступен.${note}`;
   const rb = $("btnResetCat");
   rb.classList.toggle("hidden", !L.hidden);
   rb.textContent = `Вернуть скрытые (${L.hidden})`;

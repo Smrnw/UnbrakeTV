@@ -70,6 +70,7 @@ type Server struct {
 	update       UpdateInfo
 	knowledge    KnowledgeInfo
 	quit         chan struct{}
+	storeSeen    string // app-store repository already read since the program started
 
 	fileMu      sync.Mutex    // guards the JSON files in the data folder
 	demoDir     string        // throw-away data folder of the demo TV
