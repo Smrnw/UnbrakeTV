@@ -12,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -712,7 +713,7 @@ func (s *Server) handleLaunchers(w http.ResponseWriter, r *http.Request) {
 	}
 	names := map[string]string{}
 	for _, p := range installed {
-		names[p] = tv.Lookup(p, true).Name
+		names[p] = s.appName(p)
 	}
 	have := map[string]bool{}
 	cat := s.catalog()
@@ -923,7 +924,10 @@ func (s *Server) handleLauncherInstall(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLauncherHome(w http.ResponseWriter, r *http.Request) {
-	var req struct{ Package string }
+	var req struct {
+		Package         string
+		DisableBlockers bool // switch off the home screens that win by priority
+	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !tv.ValidPackage(req.Package) {
 		httpErr(w, 400, "неверный запрос")
 		return
@@ -933,12 +937,69 @@ func (s *Server) handleLauncherHome(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 409, err.Error())
 		return
 	}
-	if err := d.SetHome(req.Package); err != nil {
+	// A home screen whose removal can break the TV is never switched off here.
+	critical := func(pkg string) bool {
+		_, hard := hardBlocked[pkg]
+		return hard || tv.Lookup(pkg, false).Level == tv.Critical
+	}
+	err = d.SetHome(req.Package)
+	var hb *tv.HomeBlocked
+	if errors.As(err, &hb) && req.DisableBlockers && !slices.ContainsFunc(hb.Blockers, critical) {
+		all, perr := d.Packages()
+		if perr != nil {
+			httpErr(w, 500, perr.Error())
+			return
+		}
+		res := removePackages(s, d, all, changeReq{Packages: hb.Blockers, Method: "disable", Accepted: true})
+		s.logHistory("remove", res)
+		for _, x := range res {
+			if !x.OK {
+				httpErr(w, 500, "Не удалось отключить «"+s.appName(x.ID)+"»: "+x.Output)
+				return
+			}
+		}
+		err = d.SetHome(req.Package)
+	}
+	if errors.As(err, &hb) {
+		type blocker struct {
+			ID       string `json:"id"`
+			Name     string `json:"name"`
+			Critical bool   `json:"critical"`
+		}
+		var list []blocker
+		var names []string
+		anyCritical := false
+		for _, b := range hb.Blockers {
+			c := critical(b)
+			anyCritical = anyCritical || c
+			list = append(list, blocker{b, s.appName(b), c})
+			names = append(names, "«"+s.appName(b)+"»")
+		}
+		msg := fmt.Sprintf("Телевизор всё равно открывает %s: у заводского рабочего стола приоритет выше, и выбор другого рабочего стола система игнорирует. Чтобы основным стал «%s», заводской нужно отключить.", strings.Join(names, " и "), s.appName(req.Package))
+		if anyCritical {
+			msg = fmt.Sprintf("Телевизор всё равно открывает %s: у заводского рабочего стола приоритет выше. Отключать его программа не станет: на части телевизоров после этого бывает чёрный экран при загрузке. Если вы уверены, отключите его вручную на вкладке «Приложения».", strings.Join(names, " и "))
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]any{"error": msg, "blockers": list})
+		return
+	}
+	if err != nil {
 		httpErr(w, 500, err.Error())
 		return
 	}
-	s.logHistory("tweak", []tv.Result{{ID: req.Package, OK: true, Method: "tweak", Output: "Основной рабочий стол: " + req.Package}})
+	s.logHistory("tweak", []tv.Result{{ID: req.Package, OK: true, Method: "tweak", Output: "Основной рабочий стол: " + s.appName(req.Package)}})
 	writeJSON(w, map[string]bool{"ok": true})
+}
+
+// appName is how the user knows an app: its name in the store, if it is there.
+func (s *Server) appName(pkg string) string {
+	for _, l := range s.catalog() {
+		if l.Package == pkg && l.Name != "" {
+			return l.Name
+		}
+	}
+	return tv.Lookup(pkg, true).Name
 }
 
 // handleLauncherStore opens the app's Google Play page on the TV screen,

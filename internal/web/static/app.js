@@ -39,7 +39,7 @@ async function api(path, body, raw) {
   const r = await fetch(path, opt);
   let j = {};
   try { j = await r.json(); } catch (_) {}
-  if (!r.ok) { const e = new Error(j.error || ("Ошибка " + r.status)); e.status = r.status; throw e; }
+  if (!r.ok) { const e = new Error(j.error || ("Ошибка " + r.status)); e.status = r.status; e.data = j; throw e; }
   return j;
 }
 
@@ -803,8 +803,22 @@ async function loadLaunchers() {
 }
 
 async function setHome(pkg) {
-  try { await api("/api/launcher/home", { package: pkg }); toast("Готово: рабочий стол изменён. Нажмите «Домой» на пульте, чтобы проверить."); }
-  catch (e) { toast(e.message, true); }
+  const done = () => toast("Готово: рабочий стол изменён. Нажмите «Домой» на пульте, чтобы проверить.");
+  try { await api("/api/launcher/home", { package: pkg }); done(); }
+  catch (e) {
+    const b = (e.data && e.data.blockers) || [];
+    if (!b.length) toast(e.message, true);
+    else if (b.some((x) => x.critical)) await modal({ title: "Рабочий стол не сменился", body: `<p>${esc(cap(e.message))}</p>`, ok: "Понятно", okClass: "primary", info: true });
+    else if (await modal({
+      title: "Заводской рабочий стол мешает",
+      body: `<p>${esc(cap(e.message))}</p><div class="group"><ul>${b.map((x) => `<li><b>${esc(x.name)}</b> <span class="pkg">${esc(x.id)}</span></li>`).join("")}</ul></div>
+        <p class="small muted">Он будет только отключён, не удалён: вернуть его можно в любой момент на вкладке «Удалённые» — тогда он снова станет основным.</p>`,
+      ok: "Отключить и сделать основным", okClass: "primary",
+    })) {
+      try { await api("/api/launcher/home", { package: pkg, disableBlockers: true }); done(); }
+      catch (e2) { toast(e2.message, true); }
+    }
+  }
   await loadPackages();
   loadLaunchers();
 }

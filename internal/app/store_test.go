@@ -41,6 +41,7 @@ type results struct {
 }
 
 type launchersResp struct {
+	Current string
 	Catalog []Launcher
 	Have    map[string]bool
 	Hidden  int
@@ -365,5 +366,73 @@ func TestStoreListFollowsRepository(t *testing.T) {
 	set("gone", strings.Repeat("3", 40), "Newest Home")
 	if got := list(c2, "?refresh=1"); got != "" || ln.Store.Stale || !strings.Contains(ln.Store.Error, "не найден") {
 		t.Fatalf("repository deleted: %q %+v", got, ln.Store)
+	}
+}
+
+// The stock launcher of Android TV has a higher priority, and the TV ignores
+// the choice of another home screen while it is enabled (the case of 26 November
+// 2026: the program said "done", the TV kept the stock home screen).
+func TestSetHomeBlockedByPriority(t *testing.T) {
+	f, _ := faketv.New(faketv.Options{})
+	defer f.Close()
+	addr, _ := f.Listen("127.0.0.1:0")
+	f.SetLauncherPriority("com.google.android.tvlauncher", 2)
+	_, c := newServer(t)
+	c.do("POST", "/api/connect", map[string]string{"address": addr}, nil)
+	c.waitStatus("connected")
+	current := func() string {
+		var ln launchersResp
+		c.do("GET", "/api/launchers", nil, &ln)
+		return ln.Current
+	}
+	const home, stock = "com.mitv.tvhome.atv", "com.google.android.tvlauncher"
+	if got := current(); got != stock {
+		t.Fatalf("the stock launcher must win by priority, got %s", got)
+	}
+
+	// The TV says "Success", but the program checks and explains.
+	var e struct {
+		Error    string
+		Blockers []struct {
+			ID, Name string
+			Critical bool
+		}
+	}
+	if code := c.do("POST", "/api/launcher/home", map[string]string{"package": home}, &e); code != 409 || len(e.Blockers) != 1 || e.Blockers[0].ID != stock || e.Blockers[0].Critical || !strings.Contains(e.Error, "приоритет") || e.Blockers[0].Name != "Главный экран Android TV" {
+		t.Fatalf("blocked: %d %+v", code, e)
+	}
+	if got := current(); got != stock {
+		t.Fatalf("nothing may change without consent, got %s", got)
+	}
+
+	// With consent the stock one is switched off, and the choice works.
+	if code := c.do("POST", "/api/launcher/home", map[string]any{"package": home, "disableBlockers": true}, nil); code != 200 {
+		t.Fatalf("disable and set: %d", code)
+	}
+	if got := current(); got != home {
+		t.Fatalf("after switching the stock one off: %s", got)
+	}
+	if p := c.packages()[stock]; p.State != "disabled" {
+		t.Fatalf("the stock launcher must be disabled, not removed: %s", p.State)
+	}
+	// It comes back from "Removed" and wins again.
+	c.do("POST", "/api/restore", changeReq{Packages: []string{stock}}, nil)
+	if got := current(); got != stock {
+		t.Fatalf("after bringing it back: %s", got)
+	}
+
+	// A home screen whose removal can break the TV is never switched off.
+	f.AddLauncher("com.google.android.apps.tv.launcherx", 3)
+	e.Blockers = nil
+	if code := c.do("POST", "/api/launcher/home", map[string]any{"package": home, "disableBlockers": true}, &e); code != 409 || !strings.Contains(e.Error, "не станет") {
+		t.Fatalf("critical blocker: %d %+v", code, e)
+	}
+	crit := false
+	for _, b := range e.Blockers {
+		crit = crit || b.ID == "com.google.android.apps.tv.launcherx" && b.Critical
+	}
+	pk := c.packages()
+	if !crit || pk[stock].State != "installed" || pk["com.google.android.apps.tv.launcherx"].State != "installed" {
+		t.Fatalf("nothing may be disabled when a critical launcher is in the way: %+v %s", e.Blockers, pk[stock].State)
 	}
 }

@@ -21,7 +21,7 @@ import (
 	"github.com/Smrnw/UnbrakeTV/internal/web"
 )
 
-var version = "1.2.1"
+var version = "1.2.2"
 
 func main() {
 	port := flag.Int("port", 0, "порт веб-интерфейса (0 — случайный)")

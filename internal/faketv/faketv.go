@@ -81,6 +81,7 @@ type TV struct {
 	third     map[string]bool
 	stubborn  map[string]bool // refuse "pm uninstall" to exercise the disable fallback
 	launchers []string
+	prio      map[string]int // declared priority of a home screen (the stock one of Android TV has 2)
 	home      string
 	settings  map[string]string
 	files     map[string][]byte
@@ -117,6 +118,7 @@ func New(opt Options) (*TV, error) {
 		restricted: map[string]bool{}, devConfig: map[string]string{}, sessions: map[string]string{}, sessionData: map[string][]byte{},
 		booted: time.Now().Add(-12 * 24 * time.Hour), screen: "home",
 		launchers: []string{"com.mitv.tvhome.atv", "com.google.android.tvlauncher"},
+		prio:      map[string]int{},
 		home:      "com.mitv.tvhome.atv",
 	}
 	for _, l := range strings.Split(packagesTxt, "\n") {
@@ -177,6 +179,31 @@ func (t *TV) listen(addr string, h func(net.Conn)) (string, error) {
 		}
 	}()
 	return ln.Addr().String(), nil
+}
+
+// SetLauncherPriority declares the priority of a home screen. Android picks
+// the home screen of the highest priority and ignores the choice of the user
+// unless several share it — this is how the stock launcher of Android TV wins.
+func (t *TV) SetLauncherPriority(pkg string, p int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.prio[pkg] = p
+}
+
+// AddLauncher adds a preinstalled home screen with the given priority.
+func (t *TV) AddLauncher(pkg string, prio int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	known := false
+	for _, p := range t.all {
+		known = known || p == pkg
+	}
+	if !known {
+		t.all = append(t.all, pkg)
+		sort.Strings(t.all)
+	}
+	t.launchers = append(t.launchers, pkg)
+	t.prio[pkg] = prio
 }
 
 // Close stops all listeners.
@@ -726,15 +753,17 @@ func (t *TV) df() string {
 }
 
 func (t *TV) homeNow() string {
-	if t.home != "" && !t.gone(t.home) {
-		return t.home
-	}
+	best, top := "", 0
 	for _, l := range t.launchers {
-		if !t.gone(l) {
-			return l
+		if !t.gone(l) && (best == "" || t.prio[l] > top) {
+			best, top = l, t.prio[l]
 		}
 	}
-	return ""
+	// The choice of the user counts only among the home screens of the top priority.
+	if t.home != "" && !t.gone(t.home) && t.prio[t.home] == top {
+		return t.home
+	}
+	return best
 }
 
 func (t *TV) install(path string) string {
@@ -798,11 +827,22 @@ func (t *TV) shell(cmd string) string {
 	case plain == "pm list packages -3":
 		return t.list(func(p string) bool { return t.third[p] && !t.removed[p] })
 	case strings.Contains(cmd, "query-activities"):
-		s := "com.android.tv.settings/.FallbackHome\n"
+		// The real format: a header, then each activity with its priority line.
+		type act struct {
+			comp string
+			prio int
+		}
+		var acts []act
 		for _, l := range t.launchers {
 			if !t.gone(l) {
-				s += l + "/.MainActivity\n"
+				acts = append(acts, act{l + "/.MainActivity", t.prio[l]})
 			}
+		}
+		acts = append(acts, act{"com.android.tv.settings/.FallbackHome", -1000})
+		sort.SliceStable(acts, func(i, j int) bool { return acts[i].prio > acts[j].prio })
+		s := fmt.Sprintf("%d activities found:\n", len(acts))
+		for i, a := range acts {
+			s += fmt.Sprintf("  Activity #%d:\n    priority=%d preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=true\n    %s\n", i, a.prio, a.comp)
 		}
 		return s
 	case strings.Contains(cmd, "resolve-activity") && !strings.Contains(cmd, "LEANBACK_LAUNCHER"):

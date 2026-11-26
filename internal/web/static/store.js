@@ -17,7 +17,7 @@ function renderLaunchers() {
   const L = S.launchers;
   if (!L) return;
   const installed = L.installed || [], names = L.names || {}, have = L.have || {};
-  const title = (id) => (S.packages.find((p) => p.id === id) || {}).name || names[id] || id;
+  const title = (id) => names[id] || (S.packages.find((p) => p.id === id) || {}).name || id;
   $("curLauncher").textContent = L.current ? "сейчас: " + title(L.current) : "";
   const card = (l) => {
     const has = have[l.id], cur = l.package && L.current === l.package;

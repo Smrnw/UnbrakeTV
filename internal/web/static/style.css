@@ -8,6 +8,7 @@
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font-size:14px;line-height:1.45}
 .hidden{display:none!important}
+a{color:var(--accent)}
 .muted{color:var(--muted)} .small{font-size:12.5px}
 .spacer{flex:1}
 button{font:inherit;border:0;border-radius:10px;padding:9px 16px;cursor:pointer;color:var(--text);background:var(--bg2);transition:.15s}

@@ -812,29 +812,86 @@ func (d *Device) SetHome(pkg string) error {
 	if !validPkg(pkg) {
 		return errors.New("некорректное имя пакета")
 	}
-	out, err := d.sh("cmd package query-activities --brief -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null")
+	acts, err := d.homeActivities()
 	if err != nil {
 		return err
 	}
-	comp := ""
-	for _, l := range lines(out) {
-		if strings.HasPrefix(l, pkg+"/") && !strings.Contains(l, " ") {
-			comp = l
+	var me *homeActivity
+	for i := range acts {
+		if acts[i].pkg == pkg {
+			me = &acts[i]
 			break
 		}
 	}
-	if comp == "" {
+	if me == nil {
 		return errors.New("это приложение не установлено или не умеет быть рабочим столом")
 	}
-	out, err = d.sh("cmd package set-home-activity " + comp + " 2>&1")
+	out, err := d.sh("cmd package set-home-activity " + me.comp + " 2>&1")
 	if err != nil {
 		return err
 	}
 	if !strings.Contains(out, "Success") {
 		return errors.New("Прошивка не разрешила сменить рабочий стол командой. Нажмите «Домой» на пульте и выберите новый рабочий стол, либо отключите стандартный на вкладке «Приложения».")
 	}
+	// "Success" only means the choice was saved. Android still opens a home
+	// screen of a higher priority (the stock launcher of Android TV has one),
+	// so check what really opens on Home.
+	if _, cur := d.Launchers(); cur != pkg {
+		seen := map[string]bool{}
+		var blockers []string
+		for _, a := range acts {
+			if a.pkg != pkg && a.prio > me.prio && !seen[a.pkg] && a.pkg != "com.android.settings" && a.pkg != "com.android.tv.settings" {
+				seen[a.pkg] = true
+				blockers = append(blockers, a.pkg)
+			}
+		}
+		if len(blockers) > 0 {
+			return &HomeBlocked{Current: cur, Blockers: blockers}
+		}
+		return errors.New("Телевизор принял команду, но рабочий стол не сменился. Нажмите «Домой» на пульте — если появится выбор, укажите нужный рабочий стол.")
+	}
 	d.sh("am start -a android.intent.action.MAIN -c android.intent.category.HOME 2>&1")
 	return nil
+}
+
+// HomeBlocked means the TV keeps opening another home screen: it is declared
+// with a higher priority, and Android ignores the choice of the user while
+// such a home screen is enabled.
+type HomeBlocked struct {
+	Current  string   // what opens on Home now
+	Blockers []string // enabled home screens of a higher priority
+}
+
+func (e *HomeBlocked) Error() string {
+	return "другой рабочий стол объявлен с более высоким приоритетом"
+}
+
+type homeActivity struct {
+	comp, pkg string
+	prio      int
+}
+
+// homeActivities lists the home screens with their declared priority.
+func (d *Device) homeActivities() ([]homeActivity, error) {
+	out, err := d.sh("cmd package query-activities --brief -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null")
+	if err != nil {
+		return nil, err
+	}
+	var res []homeActivity
+	prio := 0
+	for _, l := range lines(out) {
+		if v, ok := strings.CutPrefix(l, "priority="); ok {
+			if f := strings.Fields(v); len(f) > 0 {
+				prio, _ = strconv.Atoi(f[0])
+			}
+			continue
+		}
+		if i := strings.Index(l, "/"); i > 0 && !strings.Contains(l, " ") {
+			res = append(res, homeActivity{comp: l, pkg: l[:i], prio: prio})
+			prio = 0
+		}
+	}
+	return res, nil
 }
 
 // OpenStore opens the Play Store page of pkg on the TV screen.
